@@ -17,6 +17,7 @@
 #ifndef _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 #define _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 
+#include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/lock/ob_bucket_lock.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
@@ -93,24 +94,49 @@ private:
 };
 
 class ObFTCacheRangeContainer;
+class ObIFTDict;
+
+// A built-in dictionary is immutable once it is loaded from the KV cache, so one
+// process-wide instance can serve every parser. The parser only keeps a raw
+// pointer to it instead of loading the cache and wrapping the ranges per parse.
+struct ObFTSharedDict
+{
+  ObFTSharedDict() : dict_(nullptr), container_(nullptr) {}
+
+  ObIFTDict *dict_;
+  ObFTCacheRangeContainer *container_;
+};
+
 class ObFTDictHub
 {
 public:
-  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_() {}
+  ObFTDictHub()
+      : is_inited_(false),
+        dict_map_(),
+        rw_dict_lock_(),
+        shared_dict_alloc_(lib::ObMemAttr("FTSharedDict")),
+        shared_dict_map_()
+  {}
   ~ObFTDictHub() {}
 
   int init();
 
   int destroy();
 
-  int build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
-
-  int load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
+  // Get the shared read-only dictionary of the given type, loading its cache
+  // and building the range dictionary on first use.
+  int get_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict);
 
 private:
   int get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info);
 
   int put_dict_info(const ObFTDictInfoKey &key, const ObFTDictInfo &info);
+
+  // Callers must hold the write lock of the dict bucket.
+  int build_cache_locked(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
+
+  // Callers must hold the write lock of the dict bucket.
+  int create_shared_dict(const ObFTDictDesc &desc, ObFTSharedDict &shared_dict);
 
 
 private:
@@ -118,6 +144,9 @@ private:
   // holds info of dict
   hash::ObHashMap<ObFTDictInfoKey, ObFTDictInfo> dict_map_;
   ObBucketLock rw_dict_lock_;
+  // owns the shared dictionaries and the cache range containers pinning them
+  common::ObArenaAllocator shared_dict_alloc_;
+  hash::ObHashMap<ObFTDictInfoKey, ObFTSharedDict> shared_dict_map_;
 };
 
 } //  namespace storage

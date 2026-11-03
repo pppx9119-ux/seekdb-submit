@@ -1128,7 +1128,8 @@ int ObLockMemtable::switch_to_leader()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (OB_FAIL(obj_lock_map_.switch_to_leader())) {
+  } else {
+    obj_lock_map_.switch_to_leader();
   }
   return ret;
 }

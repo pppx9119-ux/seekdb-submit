@@ -35,6 +35,13 @@ namespace transaction
 namespace tablelock
 {
 
+void ObLockTable::CheckObjLockTask::runTimerTask()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(lock_table_.check_and_clear_obj_lock(true /* force_compact */))) {
+  }
+}
+
 int ObLockTable::restore_lock_table_(ObITable &sstable)
 {
   LOG_INFO("ObLockTable::restore_lock_table", K(sstable));
@@ -204,6 +211,7 @@ int ObLockTable::init(ObLS *parent)
   } else if (OB_FAIL(parent->get_tablet_svr()->get_lock_memtable_mgr(memtable_mgr_handle))) {
   } else if (OB_ISNULL(lock_mt_mgr_ = static_cast<ObLockMemtableMgr*>(memtable_mgr_handle.get_memtable_mgr()))) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(check_obj_lock_timer_.init("OBJLockCheck", ObMemAttr("OBJLockCheck")))) {
   } else {
     parent_ = parent;
     is_inited_ = true;
@@ -221,6 +229,11 @@ int ObLockTable::prepare_for_safe_destroy()
 
 void ObLockTable::destroy()
 {
+  if (check_obj_lock_timer_.inited()) {
+    check_obj_lock_timer_.cancel_task(check_obj_lock_task_);
+    check_obj_lock_timer_.wait_task(check_obj_lock_task_);
+    check_obj_lock_timer_.destroy();
+  }
   parent_ = nullptr;
   lock_mt_mgr_ = nullptr;
   lock_memtable_handle_.reset();
@@ -692,11 +705,24 @@ int ObLockTable::activate()
   common::ObTimeGuard timeguard("switch_to_leader", 10 * 1000);
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (OB_FAIL(check_and_clear_obj_lock(true))) {
+  } else {
+    timeguard.click();
+    if (OB_NOT_NULL(parent_)) {
+      LOG_INFO("start to check and clear obj lock when switch to leader", K(ret));
+    }
+    if (OB_FAIL(check_obj_lock_timer_.schedule(check_obj_lock_task_,
+                                               0 /* delay */,
+                                               false /* repeat */))) {
+    }
   }
   timeguard.click();
 
-  if (OB_SUCC(ret)) {
+  if (OB_FAIL(ret)) {
+    if (OB_ISNULL(parent_)) {
+      // ignore ret
+    } else {
+    }
+  } else {
     // switch to leader for lock memtable
     ObTableHandleV2 handle;
     ObLockMemtable *lock_memtable = nullptr;
