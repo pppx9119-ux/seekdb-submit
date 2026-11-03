@@ -1,11 +1,12 @@
 name: CI Check
 
-# Lightweight cloud compile check for the FTS performance branch.
+# Cloud-side compile check for the FTS performance branch.
 #
-# It initializes the third-party dependencies and configures CMake, which emits
-# compile_commands.json.  It then runs a syntax-only compile of every Storage/FTS
-# translation unit (plus the changed SQL/DAS file) using the exact flags CMake
-# would use.  The full seekdb binary is never built.
+# It initializes the third-party dependencies, configures CMake, builds the Rust
+# export headers (config_bridge.h), then syntax-checks the *unity translation
+# units* that contain the changed Storage/FTS and SQL/DAS sources.  The real
+# build compiles those same unity files, so include order and transitive headers
+# match production.  The seekdb binary is never linked.
 
 on:
   workflow_dispatch:
@@ -20,6 +21,7 @@ on:
       - 'cmake/**'
       - 'deps/init/**'
       - 'tools/cmake/**'
+      - 'rust/**'
 
 permissions:
   contents: read
@@ -32,7 +34,7 @@ jobs:
   syntax-check:
     name: FTS syntax check
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Free disk space
@@ -49,16 +51,41 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git wget rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5 python3
 
-      - name: Cache third-party dependencies
-        uses: actions/cache@v4
+      - name: Restore third-party dependencies
+        id: deps-cache
+        uses: actions/cache/restore@v4
         with:
           path: deps/3rd
           key: seekdb-deps-el9-x86_64-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
 
+      - name: Restore Rust build artifacts
+        id: rust-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build_release/rust-target
+          key: seekdb-rust-release-${{ hashFiles('rust/**', 'cmake/Rust.cmake') }}
+
       - name: Initialize dependencies and configure CMake
         run: ./build.sh release --init
 
-      - name: Syntax check touched translation units
+      - name: Save third-party dependencies
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: deps/3rd
+          key: seekdb-deps-el9-x86_64-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+
+      - name: Build Rust export headers
+        run: cmake --build build_release --target rust_staticlibs_build --parallel "$(nproc)"
+
+      - name: Save Rust build artifacts
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build_release/rust-target
+          key: seekdb-rust-release-${{ hashFiles('rust/**', 'cmake/Rust.cmake') }}
+
+      - name: Syntax check touched unity translation units
         run: |
           python3 - <<'PY'
           import glob
@@ -77,13 +104,6 @@ jobs:
           with open(COMMANDS, encoding="utf-8") as stream:
               entries = json.load(stream)
 
-          def command_for(target):
-              marker = "CMakeFiles/{}.dir/".format(target)
-              for entry in entries:
-                  argv = entry.get("arguments") or shlex.split(entry.get("command", ""))
-                  if any(marker in arg for arg in argv):
-                      return entry
-              return None
 
           def argv_of(entry):
               argv = entry.get("arguments")
@@ -91,13 +111,34 @@ jobs:
                   argv = shlex.split(entry.get("command", ""))
               return list(argv)
 
+
+          def resolved_file(entry):
+              path = entry.get("file", "")
+              if not os.path.isabs(path):
+                  path = os.path.join(entry.get("directory", "."), path)
+              return os.path.realpath(path)
+
+
+          def entry_for(source):
+              target = os.path.realpath(source)
+              for entry in entries:
+                  if resolved_file(entry) == target:
+                      return entry
+              return None
+
+
           def syntax_check(entry, source):
               argv = argv_of(entry)
               cleaned = []
               index = 0
+              no_value = {"-MD", "-MMD", "-M", "-MM"}
+              takes_value = {"-o", "-c", "-MT", "-MF", "-MQ", "-MJ"}
               while index < len(argv):
                   arg = argv[index]
-                  if arg in ("-o", "-c") and index + 1 < len(argv):
+                  if arg in no_value:
+                      index += 1
+                      continue
+                  if arg in takes_value and index + 1 < len(argv):
                       index += 2
                       continue
                   cleaned.append(arg)
@@ -105,27 +146,59 @@ jobs:
               cleaned.extend(["-fsyntax-only", os.path.abspath(source)])
               return subprocess.run(cleaned, cwd=entry.get("directory", ".")).returncode
 
-          targets = {
-              "ob_storage": sorted(glob.glob("src/storage/fts/**/*.cpp", recursive=True)),
-              "ob_sql": ["src/sql/das/ob_das_domain_utils.cpp"],
-          }
+
+          unity_files = sorted(glob.glob(
+              os.path.join(BUILD_DIR, "**", "unity", "unity_*_cxx.cxx"),
+              recursive=True))
+          print("unity translation units: {}".format(len(unity_files)), flush=True)
+          if not unity_files:
+              sys.exit("no CMake unity sources found under " + BUILD_DIR)
+
+          touched = sorted(glob.glob("src/storage/fts/**/*.cpp", recursive=True))
+          touched.append("src/sql/das/ob_das_domain_utils.cpp")
+
+          unity_text = {}
+          for path in unity_files:
+              with open(path, encoding="utf-8", errors="replace") as stream:
+                  unity_text[path] = stream.read()
+
+          selected = []
+          seen = set()
+          uncovered = []
+          for source in touched:
+              owners = [path for path, text in unity_text.items() if source in text]
+              if not owners:
+                  uncovered.append(source)
+                  continue
+              for path in owners:
+                  if path not in seen:
+                      seen.add(path)
+                      selected.append(path)
+              print("{} -> {}".format(
+                  source, ", ".join(os.path.basename(path) for path in owners)), flush=True)
 
           failed = []
-          for target, sources in targets.items():
-              entry = command_for(target)
+          print("\nsyntax-checking {} unity translation units".format(len(selected)), flush=True)
+          for path in selected:
+              entry = entry_for(path)
               if entry is None:
-                  sys.exit("no compile command found for target " + target)
-              print("{}: {} files, compiler {}".format(
-                  target, len(sources), argv_of(entry)[0]), flush=True)
-              for source in sources:
-                  print("checking " + source, flush=True)
-                  if syntax_check(entry, source) != 0:
-                      failed.append(source)
+                  sys.exit("no compile command for " + path)
+              print("  checking " + path, flush=True)
+              if syntax_check(entry, path) != 0:
+                  failed.append(path)
+
+          for source in uncovered:
+              entry = entry_for(source)
+              if entry is None:
+                  sys.exit("touched source is not in a unity group and has no compile command: " + source)
+              print("  checking standalone " + source, flush=True)
+              if syntax_check(entry, source) != 0:
+                  failed.append(source)
 
           if failed:
               print("\nSYNTAX CHECK FAILED:")
-              for source in failed:
-                  print("  " + source)
+              for path in failed:
+                  print("  " + path)
               sys.exit(1)
           print("\nAll syntax checks passed.")
           PY
