@@ -1,0 +1,131 @@
+name: CI Check
+
+# Lightweight cloud compile check for the FTS performance branch.
+#
+# It initializes the third-party dependencies and configures CMake, which emits
+# compile_commands.json.  It then runs a syntax-only compile of every Storage/FTS
+# translation unit (plus the changed SQL/DAS file) using the exact flags CMake
+# would use.  The full seekdb binary is never built.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/perf-optimization
+    paths:
+      - '.github/workflows/ci-check.yml'
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'build.sh'
+      - 'cmake/**'
+      - 'deps/init/**'
+      - 'tools/cmake/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  syntax-check:
+    name: FTS syntax check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Free disk space
+        uses: insightsengineering/disk-space-reclaimer@v1
+        with:
+          tools-cache: false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y git wget rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5 python3
+
+      - name: Cache third-party dependencies
+        uses: actions/cache@v4
+        with:
+          path: deps/3rd
+          key: seekdb-deps-el9-x86_64-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+
+      - name: Initialize dependencies and configure CMake
+        run: ./build.sh release --init
+
+      - name: Syntax check touched translation units
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+          import shlex
+          import subprocess
+          import sys
+
+          BUILD_DIR = "build_release"
+          COMMANDS = os.path.join(BUILD_DIR, "compile_commands.json")
+
+          if not os.path.isfile(COMMANDS):
+              sys.exit("missing " + COMMANDS + "; CMake configure did not complete")
+
+          with open(COMMANDS, encoding="utf-8") as stream:
+              entries = json.load(stream)
+
+          def command_for(target):
+              marker = "CMakeFiles/{}.dir/".format(target)
+              for entry in entries:
+                  argv = entry.get("arguments") or shlex.split(entry.get("command", ""))
+                  if any(marker in arg for arg in argv):
+                      return entry
+              return None
+
+          def argv_of(entry):
+              argv = entry.get("arguments")
+              if argv is None:
+                  argv = shlex.split(entry.get("command", ""))
+              return list(argv)
+
+          def syntax_check(entry, source):
+              argv = argv_of(entry)
+              cleaned = []
+              index = 0
+              while index < len(argv):
+                  arg = argv[index]
+                  if arg in ("-o", "-c") and index + 1 < len(argv):
+                      index += 2
+                      continue
+                  cleaned.append(arg)
+                  index += 1
+              cleaned.extend(["-fsyntax-only", os.path.abspath(source)])
+              return subprocess.run(cleaned, cwd=entry.get("directory", ".")).returncode
+
+          targets = {
+              "ob_storage": sorted(glob.glob("src/storage/fts/**/*.cpp", recursive=True)),
+              "ob_sql": ["src/sql/das/ob_das_domain_utils.cpp"],
+          }
+
+          failed = []
+          for target, sources in targets.items():
+              entry = command_for(target)
+              if entry is None:
+                  sys.exit("no compile command found for target " + target)
+              print("{}: {} files, compiler {}".format(
+                  target, len(sources), argv_of(entry)[0]), flush=True)
+              for source in sources:
+                  print("checking " + source, flush=True)
+                  if syntax_check(entry, source) != 0:
+                      failed.append(source)
+
+          if failed:
+              print("\nSYNTAX CHECK FAILED:")
+              for source in failed:
+                  print("  " + source)
+              sys.exit(1)
+          print("\nAll syntax checks passed.")
+          PY
