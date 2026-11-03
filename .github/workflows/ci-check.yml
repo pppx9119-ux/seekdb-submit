@@ -1,12 +1,16 @@
-name: CI Check
+name: SeekDB full build and FTS benchmark
 
-# Cloud-side compile check for the FTS performance branch.
+# Cloud-side full verification for the FTS performance branch.
 #
-# It initializes the third-party dependencies, configures CMake, builds the Rust
-# export headers (config_bridge.h), then syntax-checks the *unity translation
-# units* that contain the changed Storage/FTS and SQL/DAS sources.  The real
-# build compiles those same unity files, so include order and transitive headers
-# match production.  The seekdb binary is never linked.
+# The job initializes the packaged third-party dependencies, configures the
+# release CMake build, compiles and links the complete `seekdb` executable
+# (the same target the production build script builds), then starts the server
+# and runs the repository's FTS benchmark script against it.
+#
+# Debug info is stripped (-g0) only to keep the build inside the hosted
+# runner's disk budget; the optimisation level and NDEBUG match the release
+# build produced by `build.sh release`.  Compilation retries automatically
+# with lower parallelism if the runner runs out of memory.
 
 on:
   workflow_dispatch:
@@ -27,14 +31,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-check-${{ github.ref }}
+  group: seekdb-full-build-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 5G
+  CCACHE_COMPRESS: 1
+
 jobs:
-  syntax-check:
-    name: FTS syntax check
+  build-and-benchmark:
+    name: Full build and FTS benchmark
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 355
 
     steps:
       - name: Free disk space
@@ -51,6 +60,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git wget rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5 python3
 
+      - name: Add swap space
+        run: |
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h /
+
       - name: Restore third-party dependencies
         id: deps-cache
         uses: actions/cache/restore@v4
@@ -65,142 +85,139 @@ jobs:
           path: build_release/rust-target
           key: seekdb-rust-release-${{ hashFiles('rust/**', 'cmake/Rust.cmake') }}
 
+      - name: Restore compiler cache
+        id: ccache-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: seekdb-ccache-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            seekdb-ccache-
+
       - name: Initialize dependencies and configure CMake
-        run: ./build.sh release --init
+        run: |
+          ./build.sh release --init \
+            -DOB_USE_CCACHE=ON \
+            -DNEED_PARSER_CACHE=OFF \
+            "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O2 -g0 -DNDEBUG" \
+            "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -g0 -DNDEBUG"
 
       - name: Save third-party dependencies
         if: steps.deps-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: deps/3rd
           key: seekdb-deps-el9-x86_64-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
 
-      - name: Build Rust export headers
-        run: cmake --build build_release --target rust_staticlibs_build --parallel "$(nproc)"
-
       - name: Save Rust build artifacts
         if: steps.rust-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: build_release/rust-target
           key: seekdb-rust-release-${{ hashFiles('rust/**', 'cmake/Rust.cmake') }}
 
-      - name: Syntax check touched unity translation units
+      - name: Build seekdb binary
+        timeout-minutes: 315
         run: |
-          python3 - <<'PY'
-          import glob
-          import json
-          import os
-          import shlex
-          import subprocess
-          import sys
+          set -uo pipefail
+          export PATH="$PWD/deps/3rd/usr/local/oceanbase/devtools/bin:$PATH"
+          which ccache
+          ccache -s || true
+          cd build_release || exit 1
 
-          BUILD_DIR = "build_release"
-          COMMANDS = os.path.join(BUILD_DIR, "compile_commands.json")
+          rc=1
+          for jobs in 4 3 2 1; do
+            log="$GITHUB_WORKSPACE/build-j${jobs}.log"
+            echo "=== make -j${jobs} seekdb ($(date -u +%H:%M:%S)) ==="
+            started=$(date +%s)
+            make -j"${jobs}" seekdb > "$log" 2>&1 &
+            make_pid=$!
+            (
+              while kill -0 "$make_pid" 2>/dev/null; do
+                sleep 300
+                if kill -0 "$make_pid" 2>/dev/null; then
+                  built=$(grep -c "Building CXX object" "$log" 2>/dev/null || true)
+                  echo "[progress] $(date -u +%H:%M:%S) compiled objects: ${built:-0}"
+                fi
+              done
+            ) &
+            reporter=$!
 
-          if not os.path.isfile(COMMANDS):
-              sys.exit("missing " + COMMANDS + "; CMake configure did not complete")
+            set +e
+            wait "$make_pid"
+            rc=$?
+            set -e
+            kill "$reporter" 2>/dev/null || true
+            wait "$reporter" 2>/dev/null || true
 
-          with open(COMMANDS, encoding="utf-8") as stream:
-              entries = json.load(stream)
+            echo "make -j${jobs} exited with ${rc} after $(( $(date +%s) - started ))s"
+            if [ "$rc" -eq 0 ]; then
+              break
+            fi
+            tail -n 150 "$log"
+            if grep -qE "Killed signal|Killed|out of memory|virtual memory exhausted|internal compiler error|Error 137" "$log"; then
+              echo "resource exhaustion detected; retrying with lower parallelism"
+              continue
+            fi
+            echo "build failed for a non-resource reason"
+            exit "$rc"
+          done
 
+          if [ "$rc" -ne 0 ]; then
+            echo "all build attempts failed"
+            exit "$rc"
+          fi
+          ls -lh src/observer/seekdb
 
-          def argv_of(entry):
-              argv = entry.get("arguments")
-              if argv is None:
-                  argv = shlex.split(entry.get("command", ""))
-              return list(argv)
+      - name: Save compiler cache
+        if: always() && steps.ccache-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: seekdb-ccache-${{ github.run_id }}-${{ github.run_attempt }}
 
+      - name: Verify built binary
+        run: |
+          ls -lh build_release/src/observer/seekdb
+          build_release/src/observer/seekdb --version
 
-          def resolved_file(entry):
-              path = entry.get("file", "")
-              if not os.path.isabs(path):
-                  path = os.path.join(entry.get("directory", "."), path)
-              return os.path.realpath(path)
+      - name: Run FTS benchmark
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          CLIENT_ROOT="$PWD/deps/3rd/u01/obclient"
+          export PATH="$CLIENT_ROOT/bin:$PATH"
+          export LD_LIBRARY_PATH="$CLIENT_ROOT/lib:$CLIENT_ROOT/lib64:${LD_LIBRARY_PATH:-}"
 
+          python3 .github/script/seekdb/sdb.py start \
+            --binary "$PWD/build_release/src/observer/seekdb" \
+            --base-dir "$PWD/.bench_instance" \
+            --port 2881
+          python3 .github/script/seekdb/sdb.py wait-ready \
+            --client "$CLIENT_ROOT/bin/obclient" \
+            --base-dir "$PWD/.bench_instance" \
+            --host 127.0.0.1 \
+            --port 2881 \
+            --user root \
+            --timeout 600
 
-          def entry_for(source):
-              target = os.path.realpath(source)
-              for entry in entries:
-                  if resolved_file(entry) == target:
-                      return entry
-              return None
+          MYSQL="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4" \
+          MYSQL_VERBOSE="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4" \
+          LABEL=ci-after \
+          OUTPUT="$GITHUB_WORKSPACE/fts_bench_report.txt" \
+          bash tools/benchmark/fts_large_bench.sh
 
+      - name: Stop seekdb
+        if: always()
+        run: python3 .github/script/seekdb/sdb.py stop --base-dir "$PWD/.bench_instance" || true
 
-          def syntax_check(entry, source):
-              argv = argv_of(entry)
-              cleaned = []
-              index = 0
-              no_value = {"-MD", "-MMD", "-M", "-MM"}
-              takes_value = {"-o", "-c", "-MT", "-MF", "-MQ", "-MJ"}
-              while index < len(argv):
-                  arg = argv[index]
-                  if arg in no_value:
-                      index += 1
-                      continue
-                  if arg in takes_value and index + 1 < len(argv):
-                      index += 2
-                      continue
-                  cleaned.append(arg)
-                  index += 1
-              cleaned.extend(["-fsyntax-only", os.path.abspath(source)])
-              return subprocess.run(cleaned, cwd=entry.get("directory", ".")).returncode
-
-
-          # CMake writes group-mode unity sources under
-          # CMakeFiles/<target>.dir/Unity/unity_<group>_cxx.cxx.
-          unity_files = sorted(glob.glob(
-              os.path.join(BUILD_DIR, "**", "unity_*_cxx.cxx"),
-              recursive=True))
-          print("unity translation units: {}".format(len(unity_files)), flush=True)
-          if not unity_files:
-              sys.exit("no CMake unity sources found under " + BUILD_DIR)
-
-          touched = sorted(glob.glob("src/storage/fts/**/*.cpp", recursive=True))
-          touched.append("src/sql/das/ob_das_domain_utils.cpp")
-
-          unity_text = {}
-          for path in unity_files:
-              with open(path, encoding="utf-8", errors="replace") as stream:
-                  unity_text[path] = stream.read()
-
-          selected = []
-          seen = set()
-          uncovered = []
-          for source in touched:
-              owners = [path for path, text in unity_text.items() if source in text]
-              if not owners:
-                  uncovered.append(source)
-                  continue
-              for path in owners:
-                  if path not in seen:
-                      seen.add(path)
-                      selected.append(path)
-              print("{} -> {}".format(
-                  source, ", ".join(os.path.basename(path) for path in owners)), flush=True)
-
-          failed = []
-          print("\nsyntax-checking {} unity translation units".format(len(selected)), flush=True)
-          for path in selected:
-              entry = entry_for(path)
-              if entry is None:
-                  sys.exit("no compile command for " + path)
-              print("  checking " + path, flush=True)
-              if syntax_check(entry, path) != 0:
-                  failed.append(path)
-
-          for source in uncovered:
-              entry = entry_for(source)
-              if entry is None:
-                  sys.exit("touched source is not in a unity group and has no compile command: " + source)
-              print("  checking standalone " + source, flush=True)
-              if syntax_check(entry, source) != 0:
-                  failed.append(source)
-
-          if failed:
-              print("\nSYNTAX CHECK FAILED:")
-              for path in failed:
-                  print("  " + path)
-              sys.exit(1)
-          print("\nAll syntax checks passed.")
-          PY
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fts-bench-report
+          path: fts_bench_report.txt
+          if-no-files-found: warn
