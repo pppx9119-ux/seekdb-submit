@@ -20,6 +20,7 @@
 #include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/lock/ob_bucket_lock.h"
+#include "lib/lock/ob_mutex.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
 
 namespace oceanbase
@@ -147,6 +148,10 @@ private:
   // owns the shared dictionaries and the cache range containers pinning them
   common::ObArenaAllocator shared_dict_alloc_;
   hash::ObHashMap<ObFTDictInfoKey, ObFTSharedDict> shared_dict_map_;
+  // Different dictionary types take different bucket locks, but they allocate
+  // from the same arena and insert into the same map, so first-time creation
+  // must be serialized.
+  lib::ObMutex create_dict_mutex_;
 };
 
 } //  namespace storage

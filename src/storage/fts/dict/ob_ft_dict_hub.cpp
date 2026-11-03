@@ -95,6 +95,7 @@ int ObFTDictHub::get_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
         }
       }
       if (OB_SUCC(ret) && OB_ISNULL(shared_dict.dict_)) {
+        lib::ObMutexGuard create_guard(create_dict_mutex_);
         if (OB_FAIL(create_shared_dict(desc, shared_dict))) {
           LOG_WARN("failed to create shared dict", K(ret), K(desc.type_));
         } else if (OB_FAIL(shared_dict_map_.set_refactored(key, shared_dict))) {
