@@ -147,8 +147,10 @@ jobs:
               return subprocess.run(cleaned, cwd=entry.get("directory", ".")).returncode
 
 
+          # CMake writes group-mode unity sources under
+          # CMakeFiles/<target>.dir/Unity/unity_<group>_cxx.cxx.
           unity_files = sorted(glob.glob(
-              os.path.join(BUILD_DIR, "**", "unity", "unity_*_cxx.cxx"),
+              os.path.join(BUILD_DIR, "**", "unity_*_cxx.cxx"),
               recursive=True))
           print("unity translation units: {}".format(len(unity_files)), flush=True)
           if not unity_files:
