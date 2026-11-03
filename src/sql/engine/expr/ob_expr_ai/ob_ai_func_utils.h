@@ -237,6 +237,7 @@ public:
   virtual ~ObAIFuncJsonUtils() {}
   static bool ob_is_json_array_all_str(ObJsonArray* json_array);
   static int transform_array_to_json_array(ObIAllocator &allocator, ObArray<ObString> &contents, ObJsonArray *&array);
+  static int reorder_embedding_array(ObIAllocator &allocator, ObJsonArray *data_array, ObJsonArray *result_array);
   static int get_json_object(ObIAllocator &allocator, ObJsonObject *&obj_node);
   static int get_json_array(ObIAllocator &allocator, ObJsonArray *&array_node);
   static int get_json_string(ObIAllocator &allocator, ObString &str, ObJsonString *&str_node);
@@ -291,6 +292,7 @@ public:
   static int get_complete_provider(ObIAllocator &allocator, const ObString &provider, ObAIFuncIComplete *&complete_provider);
   static int get_embed_provider(ObIAllocator &allocator, const ObString &provider, ObAIFuncIEmbed *&embed_provider);
   static int get_rerank_provider(ObIAllocator &allocator, const ObString &provider, ObAIFuncIRerank *&rerank_provider);
+  static int check_completion_config(ObJsonObject *config);
   static int get_header(ObIAllocator &allocator,
                         const ObAIFuncExprInfo &info,
                         const share::ObAiModelEndpointInfo &endpoint_info,
@@ -329,6 +331,12 @@ public:
                                  ObJsonObject *http_response,
                                  ObIJsonBase *&result);
   static int set_string_result(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res, ObString &res_str);
+  static int set_string_result(const ObExpr &expr, ObEvalCtx &ctx, ObDatum *res, ObString &res_str);
+  // The batch version writes the result into the datum of row %datum_idx, so every
+  // row gets its own result buffer instead of sharing the buffer of the current
+  // batch index.
+  static int set_string_result(const ObExpr &expr, ObEvalCtx &ctx, ObDatum *res,
+                               const int64_t datum_idx, ObString &res_str);
   static bool is_provider_support_base64(const ObString &provider);
   static int decode_base64_embedding_array(const ObIJsonBase &embedding_jbase, ObIAllocator &allocator,
                                            const int64_t dimension, float *&vector);
