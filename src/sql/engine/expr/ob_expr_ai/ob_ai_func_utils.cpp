@@ -172,9 +172,9 @@ int ObOpenAIUtils::ObOpenAIComplete::parse_output(common::ObIAllocator &allocato
     if (OB_FAIL(j_path.parse_path())) {
     } else if (OB_FAIL(j_tree->seek(j_path, j_path.path_node_cnt(), false, false, hit))) {
     } else if (hit.size() == 0 || OB_ISNULL(hit[0])) {
-      ret = OB_ERR_UNEXPECTED;
+      ret = OB_INVALID_DATA;
     } else if (hit[0]->json_type() != ObJsonNodeType::J_STRING || hit[0]->get_data_length() == 0) {
-      ret = OB_ERR_UNEXPECTED;
+      ret = OB_INVALID_DATA;
     } else {
       result = hit[0];
     }
@@ -230,23 +230,20 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
     ObJsonNode *data_node = nullptr;
     if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, result_array))) {
     } else if (OB_ISNULL(data_node = http_response->get_value("data"))) {
-      ret = OB_ERR_UNEXPECTED;
+      ret = OB_INVALID_DATA;
     } else if (data_node->json_type() != ObJsonNodeType::J_ARRAY) {
-      ret = OB_ERR_UNEXPECTED;
+      ret = OB_INVALID_DATA;
     } else {
       ObJsonArray *data_array = static_cast<ObJsonArray *>(data_node);
       const int64_t count = data_array->element_count();
       if (count <= 0) {
-        ret = OB_ERR_UNEXPECTED;
+        ret = OB_INVALID_DATA;
+      } else if (OB_FAIL(ObAIFuncJsonUtils::reorder_embedding_array(allocator, data_array, result_array))) {
+        // A malformed provider answer, for example a missing embedding, is
+        // reported as invalid data, which is what the provider contract raises
+        // for an answer that cannot be interpreted.
       } else {
-        const int tmp_ret = ObAIFuncJsonUtils::reorder_embedding_array(allocator, data_array, result_array);
-        if (OB_SUCCESS != tmp_ret) {
-          // A malformed provider answer, for example a missing embedding, is an
-          // unexpected response; the official unit test expects OB_ERR_UNEXPECTED.
-          ret = OB_ERR_UNEXPECTED;
-        } else {
-          result = result_array;
-        }
+        result = result_array;
       }
     }
   }
