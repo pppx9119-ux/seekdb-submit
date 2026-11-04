@@ -287,6 +287,11 @@ jobs:
 
           echo "----- mock AI service request log -----"
           tail -n 200 "$GITHUB_WORKSPACE/ai_mock.log" || true
+          if [ "$failed" -ne 0 ]; then
+            echo "----- AI model endpoints after the test run -----"
+            "$CLIENT_ROOT/bin/obclient" -h127.0.0.1 -P2881 -uadmin -padmin -Dtest -c -e \
+              "select ENDPOINT_NAME, PROVIDER, URL, ACCESS_KEY IS NULL AS ACCESS_KEY_IS_NULL, MAX_CONCURRENCY from oceanbase.DBA_OB_AI_MODEL_ENDPOINTS;" || true
+          fi
           exit "$failed"
 
       - name: Stop seekdb
@@ -311,4 +316,5 @@ jobs:
             .ai_instance/log/**
             .ai_instance/etc/**
             build-j*.log
+          include-hidden-files: true
           if-no-files-found: warn
