@@ -1,12 +1,13 @@
-name: SeekDB AI functions build and mysqltest
+name: SeekDB competition build and mysqltest
 
-# Cloud-side verification for the AI function enhancement work.
+# Cloud-side verification for the 2026 competition work.
 #
 # The job initializes the packaged third-party dependencies, configures and
 # runs the release CMake build, compiles and links the complete `seekdb`
 # executable, starts a local instance together with the deterministic mock AI
 # service (0.0.0.0:8000) used by the official ai_function mysqltests, executes
-# those tests with the same client/environment as the repository CI, and
+# the ai_function and file_sql suites with the same client/environment as the
+# repository CI, and
 # publishes the test logs and reject files.
 #
 # Debug info is stripped (-g0) only to keep the build inside the hosted
@@ -18,8 +19,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - feature/ai-functions-v2
-      - feature/seekdb-all-in-one
+      - 2026-competition
     paths:
       - '.github/workflows/ci-check.yml'
       - '.github/script/seekdb/ai_mock_service.py'
@@ -31,12 +31,14 @@ on:
       - 'tools/cmake/**'
       - 'rust/**'
       - 'tools/deploy/mysql_test/test_suite/ai_function/**'
+      - 'tools/deploy/mysql_test/test_suite/file_sql/**'
+      - 'tools/deploy/mysql_test/test_suite/ai_column/**'
 
 permissions:
   contents: read
 
 concurrency:
-  group: seekdb-ai-functions-${{ github.ref }}
+  group: seekdb-competition-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -46,7 +48,7 @@ env:
 
 jobs:
   build-and-test:
-    name: Full build and AI function mysqltest
+    name: Full build and official mysqltest
     runs-on: ubuntu-22.04
     timeout-minutes: 355
 
@@ -63,7 +65,28 @@ jobs:
         run: |
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update
-          sudo apt-get install -y git wget rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5 python3
+          sudo apt-get install -y git wget rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5 python3 openssh-server
+
+
+      - name: Enable passwordless SSH to localhost
+        run: |
+          set -euo pipefail
+          sudo systemctl start ssh
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          rm -f ~/.ssh/id_rsa ~/.ssh/id_rsa.pub
+          ssh-keygen -t rsa -b 2048 -N '' -f ~/.ssh/id_rsa -q
+          touch ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          grep -qF "$(cat ~/.ssh/id_rsa.pub)" ~/.ssh/authorized_keys || \
+            cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+          for host in 127.0.0.1 localhost $(hostname -I); do
+            ssh-keyscan -H "$host" >> ~/.ssh/known_hosts 2>/dev/null || true
+          done
+          ssh -o BatchMode=yes 127.0.0.1 true
+          for host in $(hostname -I); do
+            ssh -o BatchMode=yes "$host" true
+          done
 
       - name: Add swap space
         run: |
@@ -225,7 +248,7 @@ jobs:
             --user root \
             --timeout 900
 
-      - name: Run AI function mysqltests
+      - name: Run official mysqltests
         timeout-minutes: 90
         run: |
           set -euo pipefail
@@ -233,7 +256,6 @@ jobs:
           export PATH="$CLIENT_ROOT/bin:$PATH"
           export LD_LIBRARY_PATH="$CLIENT_ROOT/lib:$CLIENT_ROOT/lib64:${LD_LIBRARY_PATH:-}"
           LOG_DIR="$GITHUB_WORKSPACE/ai_test_logs"
-          CASE_DIR="$PWD/tools/deploy/mysql_test/test_suite/ai_function"
           mkdir -p "$LOG_DIR"
 
           cd tools/deploy
@@ -250,13 +272,17 @@ jobs:
           export TENANT=mysql
 
           failed=0
-          for case_name in \
-            ai_prompt \
-            ai_function_enhancement \
-            ai_model_ddl \
-            ai_model_endpoint_ddl \
-            ai_model_lower_case_name_mysql0 \
-            ai_model_lower_case_name_mysql1; do
+          for spec in \
+            ai_function:ai_prompt \
+            ai_function:ai_function_enhancement \
+            ai_function:ai_model_ddl \
+            ai_function:ai_model_endpoint_ddl \
+            ai_function:ai_model_lower_case_name_mysql0 \
+            ai_function:ai_model_lower_case_name_mysql1 \
+            file_sql:file_sql_basic; do
+            suite=${spec%%:*}
+            case_name=${spec##*:}
+            CASE_DIR="$GITHUB_WORKSPACE/tools/deploy/mysql_test/test_suite/$suite"
             echo "::group::mysqltest ${case_name}"
             rm -f "$LOG_DIR/${case_name}.reject"
             set +e
@@ -310,7 +336,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ai-function-test-logs
+          name: competition-test-logs
           path: |
             ai_test_logs/**
             ai_mock.log
