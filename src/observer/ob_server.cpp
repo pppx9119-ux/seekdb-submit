@@ -59,6 +59,7 @@ int ObServer::get_lower_bound_freeze_info(const int64_t snapshot_version, share:
 #include "observer/omt/ob_server_runtime.h"
 #include "sql/engine/px/p2p_datahub/ob_p2p_dh_mgr.h"
 #include "sql/ob_sql_init.h"
+#include "sql/ob_ai_column_worker.h"
 #include "sql/ob_sql_task.h"
 #include "sql/engine/cmd/ob_load_data_utils.h"
 #include "storage/tx_table/ob_tx_data_cache.h"
@@ -912,6 +913,9 @@ void ObServer::destroy()
   // Cause ObBackupInfo to lock the mutex that has been destroyed by itself, and finally trigger the core
   // This is essentially an implementation problem of repeated destruction of ObBackupInfo (or one of its members). ObServer also adds a layer of defense here.
   FLOG_INFO("[OBSERVER_NOTICE] destroy observer begin");
+  // The AI column worker issues SQL through a session of its own, so it has to
+  // stop before the server tears anything down underneath it.
+  sql::ai_column::ObAIColumnWorker::get_instance().stop();
   if (sql::ddl_slice_store() == this) {
     sql::register_ddl_slice_store(nullptr);
   }

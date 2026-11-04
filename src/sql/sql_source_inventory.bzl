@@ -20,6 +20,8 @@ SQL_UNITY_GROUPS = [
         name = "ob_sql_common_0",
         language = "c++",
         srcs = [
+            "src/sql/ob_ai_column_rewriter.cpp",
+            "src/sql/ob_ai_column_worker.cpp",
             "src/sql/ob_end_trans_callback.cpp",
             "src/sql/ob_end_trans_cb_packet_param.cpp",
             "src/sql/ob_file_sql_rewriter.cpp",

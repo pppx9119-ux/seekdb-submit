@@ -18,6 +18,7 @@
 #include "config_bridge.h"
 #include "sql/ob_sql.h"
 #include "sql/ob_file_sql_rewriter.h"
+#include "sql/ob_ai_column_rewriter.h"
 #include "lib/json/ob_json_print_utils.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "query/runtime/ob_query_runtime_environment.h"
@@ -1955,6 +1956,18 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
                                                 rewritten_stmt, file_sql_rewritten))) {
   } else if (file_sql_rewritten) {
     trimed_stmt = rewritten_stmt;
+  }
+
+  // AI columns are lowered to plain columns and derived metadata tables here,
+  // for the same reason: the statement that reaches the parser stays ordinary
+  // SQL that the plan cache can hold.
+  ObString ai_column_stmt;
+  bool ai_column_rewritten = false;
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(ObAIColumnRewriter::rewrite(allocator, session, trimed_stmt,
+                                                 ai_column_stmt, ai_column_rewritten))) {
+  } else if (ai_column_rewritten) {
+    trimed_stmt = ai_column_stmt;
   }
 
   ObExecContext& ectx = result.get_exec_context();

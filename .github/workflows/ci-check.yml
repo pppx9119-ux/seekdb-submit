@@ -279,7 +279,12 @@ jobs:
             ai_function:ai_model_endpoint_ddl \
             ai_function:ai_model_lower_case_name_mysql0 \
             ai_function:ai_model_lower_case_name_mysql1 \
-            file_sql:file_sql_basic; do
+            file_sql:file_sql_basic \
+            ai_column:ai_column_ddl \
+            ai_column:ai_column_t1_dml \
+            ai_column:ai_column_vector_index \
+            ai_column:ai_column_worker \
+            ai_column:ai_column_retry_strict; do
             suite=${spec%%:*}
             case_name=${spec##*:}
             CASE_DIR="$GITHUB_WORKSPACE/tools/deploy/mysql_test/test_suite/$suite"

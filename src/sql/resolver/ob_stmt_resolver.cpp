@@ -18,6 +18,7 @@
 #include "sql/resolver/ob_stmt_resolver.h"
 
 #include "sql/session/ob_sql_session_info.h"
+#include "sql/ob_ai_column_common.h"
 
 namespace oceanbase
 {
@@ -218,9 +219,12 @@ int ObStmtResolver::get_column_schema(const uint64_t table_id,
     const bool hidden = get_hidden || session_info_->is_inner();
 
     // Generated columns added by function-based indexes are hidden but may
-    // still be selected through this path.
+    // still be selected through this path. The bookkeeping columns of an AI
+    // column are hidden the same way and are addressed by name in the SQL the
+    // rewrite step and the background worker generate.
     if (OB_FAIL(schema_checker_->get_column_schema( table_id, column_name, column_schema, true, is_link))) {
-    } else if (!hidden && column_schema->is_hidden() && !column_schema->is_generated_column()) {
+    } else if (!hidden && column_schema->is_hidden() && !column_schema->is_generated_column()
+               && !ai_column::is_ai_hidden_comment(column_schema->get_comment())) {
       ret = OB_ERR_BAD_FIELD_ERROR;
       LOG_INFO("do not get hidden column", K(table_id), K(column_name), K(ret));
     }

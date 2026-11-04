@@ -23,6 +23,7 @@
 #include "sql/pl/ob_pl_stmt.h"
 #include "sql/privilege_check/ob_privilege_check.h"
 #include "sql/resolver/ob_stmt_resolver.h"
+#include "sql/ob_ai_column_common.h"
 #include "share/schema/ob_schema_getter_guard.h"
 
 using namespace oceanbase::sql;
@@ -375,7 +376,8 @@ int ObSchemaChecker::get_column_schema(
       } else {
         column_schema = column;
       }
-    } else if (!get_hidden && column->is_hidden()) {
+    } else if (!get_hidden && column->is_hidden()
+               && !ai_column::is_ai_hidden_comment(column->get_comment())) {
       ret = OB_ERR_BAD_FIELD_ERROR;
       LOG_INFO("do not get hidden column", K(table_id), K(column_name), K(ret));
     } else {
@@ -404,7 +406,8 @@ int ObSchemaChecker::get_column_schema(
   } else if (OB_FAIL(get_column_schema_inner(table_id, column_id, column, is_link))) {
   } else if (NULL == column) {
     ret = OB_ERR_BAD_FIELD_ERROR;
-  } else if (!get_hidden && column->is_hidden()) {
+  } else if (!get_hidden && column->is_hidden()
+             && !ai_column::is_ai_hidden_comment(column->get_comment())) {
     ret = OB_ERR_BAD_FIELD_ERROR;
     LOG_INFO("do not get hidden column", K(table_id), K(column_id), K(ret));
   } else {

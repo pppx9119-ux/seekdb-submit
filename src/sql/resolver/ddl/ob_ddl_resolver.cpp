@@ -28,6 +28,7 @@
 #include "sql/resolver/ddl/ob_vec_index_builder_util.h"
 #include "sql/resolver/ddl/ob_fts_parser_resolver.h"
 #include "sql/session/ob_local_session_var.h"
+#include "sql/ob_ai_column_common.h"
 #include "query/ddl/ob_dynamic_partition_policy.h"
 #include "share/rc/ob_server_runtime.h"
 #include "share/schema/ob_table_schema.h"
@@ -2182,6 +2183,11 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
                                                             MAX_COLUMN_COMMENT_CHAR_LENGTH))){
             } else {
               column.set_comment(ObString(comment_length, comment_ptr));
+              // The AI column bookkeeping columns carry a marker in their
+              // comment so they land as hidden columns of the base table.
+              if (ai_column::is_ai_hidden_comment(column.get_comment())) {
+                column.set_is_hidden(true);
+              }
             }
           }
         }
