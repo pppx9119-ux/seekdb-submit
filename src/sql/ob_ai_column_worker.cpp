@@ -182,7 +182,9 @@ int encode_value(const ObAIColumnSpec &spec, const std::string &text, std::strin
       if (!is_vector_text(text)) {
         ret = OB_INVALID_DATA;
       } else {
-        literal = text;
+        // Vector values are written as the string form the SQL layer accepts
+        // for a vector column, the same literal an INSERT uses.
+        literal.assign("'").append(sql_escape(text)).append("'");
       }
       break;
     case AI_COLUMN_RESULT_JSON:
