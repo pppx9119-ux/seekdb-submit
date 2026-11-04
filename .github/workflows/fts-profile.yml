@@ -1,0 +1,374 @@
+name: FTS hot path profile
+
+# Experimental profiling workflow, separate from the submission branch.
+#
+# It builds the same binary as ci-check.yml, starts the server, samples the
+# running process with eu-stack while it builds a full-text index and runs the
+# TOKENIZE/MATCH workload, then aggregates the samples into a function-level
+# hotspot summary.  Only the summary is uploaded; the official benchmark
+# scripts, data and scoring inputs are used unchanged.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - competition/fts-profile
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seekdb-fts-profile-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 4G
+  CCACHE_COMPRESS: 1
+
+jobs:
+  profile:
+    name: Build, sample and aggregate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+
+    steps:
+      - name: Free disk space
+        uses: insightsengineering/disk-space-reclaimer@v1
+        with:
+          tools-cache: false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build prerequisites
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y git wget rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5 python3
+
+      - name: Add swap space
+        run: |
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h /
+          nproc
+
+      - name: Restore third-party dependencies
+        id: deps-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: deps/3rd
+          key: seekdb-deps-el9-x86_64-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+
+      - name: Restore Rust build artifacts
+        id: rust-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build_release/rust-target
+          key: seekdb-rust-release-${{ hashFiles('rust/**', 'cmake/Rust.cmake') }}
+
+      - name: Restore compiler cache
+        id: ccache-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: seekdb-fts-ccache-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            seekdb-fts-ccache-
+
+      - name: Initialize dependencies and configure CMake
+        run: |
+          ./build.sh release --init \
+            -DOB_USE_CCACHE=ON \
+            -DNEED_PARSER_CACHE=OFF \
+            "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O2 -g0 -DNDEBUG" \
+            "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -g0 -DNDEBUG"
+
+      - name: Save third-party dependencies
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: deps/3rd
+          key: seekdb-deps-el9-x86_64-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+
+      - name: Save Rust build artifacts
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: build_release/rust-target
+          key: seekdb-rust-release-${{ hashFiles('rust/**', 'cmake/Rust.cmake') }}
+
+      - name: Build seekdb binary
+        timeout-minutes: 315
+        run: |
+          set -uo pipefail
+          export PATH="$PWD/deps/3rd/usr/local/oceanbase/devtools/bin:$PATH"
+          cd build_release || exit 1
+
+          rc=1
+          for jobs in 4 3 2 1; do
+            log="$GITHUB_WORKSPACE/build-j${jobs}.log"
+            echo "=== make -j${jobs} seekdb ($(date -u +%H:%M:%S)) ==="
+            started=$(date +%s)
+            set +e
+            make -j"${jobs}" seekdb > "$log" 2>&1
+            rc=$?
+            set -e
+            echo "make -j${jobs} exited with ${rc} after $(( $(date +%s) - started ))s"
+            if [ "$rc" -eq 0 ]; then
+              break
+            fi
+            tail -n 150 "$log"
+            if grep -qE "Killed signal|Killed|out of memory|virtual memory exhausted|internal compiler error|Error 137" "$log"; then
+              echo "resource exhaustion detected; retrying with lower parallelism"
+              continue
+            fi
+            echo "build failed for a non-resource reason"
+            exit "$rc"
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "all build attempts failed"
+            exit "$rc"
+          fi
+          ls -lh src/observer/seekdb
+          file src/observer/seekdb || true
+
+      - name: Save compiler cache
+        if: always() && steps.ccache-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: seekdb-fts-ccache-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Install profiler
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get install -y elfutils
+          eu-stack --version
+          sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+          cat /proc/sys/kernel/yama/ptrace_scope
+
+      - name: Start server and load benchmark data
+        run: |
+          set -euo pipefail
+          CLIENT_ROOT="$PWD/deps/3rd/u01/obclient"
+          export PATH="$CLIENT_ROOT/bin:$PATH"
+          export LD_LIBRARY_PATH="$CLIENT_ROOT/lib:$CLIENT_ROOT/lib64:${LD_LIBRARY_PATH:-}"
+          INSTANCE="$PWD/.bench_instance"
+          rm -rf "$INSTANCE"
+          python3 .github/script/seekdb/sdb.py start \
+            --binary "$PWD/build_release/src/observer/seekdb" \
+            --base-dir "$INSTANCE" \
+            --port 2881
+          python3 .github/script/seekdb/sdb.py wait-ready \
+            --client "$CLIENT_ROOT/bin/obclient" \
+            --base-dir "$INSTANCE" \
+            --host 127.0.0.1 \
+            --port 2881 \
+            --user root \
+            --timeout 600
+          MYSQL_VERBOSE="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4"
+          $MYSQL_VERBOSE < tools/benchmark/fts_large_bench_setup.sql
+          python3 tools/benchmark/fts_large_bench_gen.py --rows 20000 --batch 500 | $MYSQL_VERBOSE >/dev/null
+          "$CLIENT_ROOT/bin/obclient" -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4 \
+            -e "USE fts_large_bench; SELECT COUNT(*) FROM docs;"
+
+      - name: Sample hot paths
+        timeout-minutes: 30
+        run: |
+          set -uo pipefail
+          CLIENT_ROOT="$PWD/deps/3rd/u01/obclient"
+          MYSQL="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -N -s -A --default-character-set=utf8mb4"
+          MYSQL_VERBOSE="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4"
+          export LD_LIBRARY_PATH="$CLIENT_ROOT/lib:$CLIENT_ROOT/lib64:${LD_LIBRARY_PATH:-}"
+          PID=$(pgrep -x seekdb | head -1)
+          echo "server pid=$PID"
+          test -n "$PID"
+          mkdir -p profile
+          for t in /proc/"$PID"/task/*; do echo "$(basename "$t") $(cat "$t/comm" 2>/dev/null)"; done > profile/threads.txt
+
+          sample() {
+            local label="$1" out="$PWD/profile/${1}.stacks" stop="$PWD/profile/${1}.stop"
+            rm -f "$stop" "$out"
+            (
+              while [ ! -f "$stop" ]; do
+                eu-stack -p "$PID" > "$out.tmp" 2>/dev/null
+                if [ -s "$out.tmp" ]; then
+                  { echo "=== SAMPLE $(date +%s.%N)"; cat "$out.tmp"; } >> "$out"
+                fi
+              done
+              rm -f "$out.tmp"
+            ) &
+            SAMPLER=$!
+            echo "$label sampler started pid=$SAMPLER"
+          }
+          stop_sample() {
+            touch "$PWD/profile/${1}.stop"
+            wait "$SAMPLER" 2>/dev/null || true
+            echo "$1 samples: $(grep -c '=== SAMPLE' "$PWD/profile/${1}.stacks" 2>/dev/null || echo 0)"
+          }
+
+          echo "=== profiling index build ==="
+          START=$(date +%s)
+          sample build
+          $MYSQL_VERBOSE -e "USE fts_large_bench; SET ob_query_timeout = 100000000000; SET ob_trx_timeout = 100000000000; ALTER TABLE docs ADD FULLTEXT INDEX fti_all_ik(title, content) WITH PARSER ik;"
+          echo "build elapsed: $(( $(date +%s) - START ))s"
+          stop_sample build
+
+          echo "=== profiling tokenize ==="
+          TOK_SQL="$PWD/profile/tokenize.sql"
+          {
+            echo "SET NAMES utf8mb4;"
+            echo "SET ob_query_timeout = 100000000000;"
+            for i in $(seq 1 15000); do
+              echo "SELECT tokenize('OceanBase是一款非常稳定的数据库，全文索引的分词器热路径优化包括解析器实例复用、停用词全局单例、内存池化数据结构等技术，在大量文档索引和查询场景下可以显著降低 CPU 开销。', 'ik');"
+            done
+          } > "$TOK_SQL"
+          START=$(date +%s)
+          sample tokenize
+          $MYSQL < "$TOK_SQL" >/dev/null
+          echo "tokenize elapsed: $(( $(date +%s) - START ))s"
+          stop_sample tokenize
+
+          echo "=== profiling query ==="
+          QRY_SQL="$PWD/profile/query.sql"
+          {
+            echo "SET NAMES utf8mb4;"
+            echo "SET ob_query_timeout = 100000000000;"
+            for i in $(seq 1 1000); do
+              echo "SELECT COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('全文索引 分词器');"
+            done
+          } > "$QRY_SQL"
+          START=$(date +%s)
+          sample query
+          $MYSQL < "$QRY_SQL" >/dev/null
+          echo "query elapsed: $(( $(date +%s) - START ))s"
+          stop_sample query
+
+          ls -lh profile/
+          for t in /proc/"$PID"/task/*; do echo "$(basename "$t") $(cat "$t/comm" 2>/dev/null)"; done > profile/threads.txt
+
+      - name: Aggregate samples
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import re
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          IDLE = re.compile(
+              r"epoll|poll|futex|nanosleep|clock_nanosleep|pthread_cond|io_getevents|"
+              r"accept|select|sigsuspend|sem_wait|__lll_lock_wait|pthread_join|"
+              r"syscall|read$|write$|recv|send|sleep|do_sigtimedwait|sigtimedwait|"
+              r"start_thread|clone|__GI___close|close$",
+              re.IGNORECASE,
+          )
+          frame_re = re.compile(r"^#(\d+)\s+0x[0-9a-fA-F]+\s+in\s+(.+?)(?:\(| from |$)")
+          tid_re = re.compile(r"^TID\s+(\d+):")
+
+          def parse(path):
+              samples = []
+              cur = None
+              tid = None
+              for line in Path(path).read_text(errors="replace").splitlines():
+                  if line.startswith("=== SAMPLE"):
+                      cur = {"when": line.split()[-1], "threads": defaultdict(list)}
+                      samples.append(cur)
+                      tid = None
+                  m = tid_re.match(line)
+                  if m:
+                      tid = m.group(1)
+                      cur["threads"][tid] = []
+                      continue
+                  m = frame_re.match(line)
+                  if m and cur is not None and tid is not None:
+                      if len(cur["threads"][tid]) < 8:
+                          cur["threads"][tid].append(m.group(2).strip())
+              return samples
+
+          def report(name):
+              path = Path(f"profile/{name}.stacks")
+              if not path.is_file():
+                  print(f"\n##### {name}: no samples")
+                  return
+              samples = parse(path)
+              leaf = Counter()
+              inclusive = Counter()
+              per_tid = Counter()
+              busy_samples = 0
+              for s in samples:
+                  busy = False
+                  for tid, frames in s["threads"].items():
+                      if not frames:
+                          continue
+                      leaf_name = frames[0]
+                      per_tid[tid] += 1
+                      if IDLE.search(leaf_name):
+                          continue
+                      busy = True
+                      leaf[leaf_name] += 1
+                      for fn in frames:
+                          inclusive[fn] += 1
+                  if busy:
+                      busy_samples += 1
+              total = max(busy_samples, 1)
+              print(f"\n##### {name}: samples={len(samples)} busy_samples={busy_samples}")
+              print(f"-- top self frames ({name}) --")
+              for fn, cnt in leaf.most_common(40):
+                  print(f"{cnt:6d} {cnt / total * 100:6.2f}%  {fn}")
+              print(f"-- top inclusive frames ({name}) --")
+              for fn, cnt in inclusive.most_common(30):
+                  print(f"{cnt:6d} {cnt / total * 100:6.2f}%  {fn}")
+              threads = {}
+              tpath = Path("profile/threads.txt")
+              if tpath.is_file():
+                  for line in tpath.read_text(errors="replace").splitlines():
+                      parts = line.split(None, 1)
+                      if len(parts) == 2:
+                          threads[parts[0]] = parts[1]
+              print(f"-- busiest tids ({name}) --")
+              for tid, cnt in per_tid.most_common(15):
+                  print(f"{cnt:6d}  tid={tid} comm={threads.get(tid, '?')}")
+
+          print("FTS hot path profile summary")
+          print("============================")
+          for name in ("build", "tokenize", "query"):
+              report(name)
+          PY
+
+      - name: Upload profile summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fts-profile
+          path: |
+            profile/threads.txt
+            build-j*.log
+          if-no-files-found: warn
+
+      - name: Upload raw samples
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: fts-profile-raw
+          path: |
+            profile/*.stacks
+          compression-level: 9
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Stop seekdb
+        if: always()
+        run: python3 .github/script/seekdb/sdb.py stop --base-dir "$PWD/.bench_instance" || true
