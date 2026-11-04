@@ -26,6 +26,9 @@ namespace sql
 {
 class ObSQLSessionInfo;
 
+namespace ai_column
+{
+
 // Rewrites AI COLUMN statements into plain SQL before the statement reaches the
 // parser:
 //   CREATE TABLE ... <col> <type> AI COLUMN (func(...)) WITH (...)
@@ -47,6 +50,8 @@ public:
                      common::ObString &rewritten_sql,
                      bool &rewritten);
 };
+
+} // namespace ai_column
 
 } // namespace sql
 } // namespace oceanbase

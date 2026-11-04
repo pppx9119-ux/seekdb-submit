@@ -1964,8 +1964,8 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
   ObString ai_column_stmt;
   bool ai_column_rewritten = false;
   if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(ObAIColumnRewriter::rewrite(allocator, session, trimed_stmt,
-                                                 ai_column_stmt, ai_column_rewritten))) {
+  } else if (OB_FAIL(ai_column::ObAIColumnRewriter::rewrite(allocator, session, trimed_stmt,
+                                                            ai_column_stmt, ai_column_rewritten))) {
   } else if (ai_column_rewritten) {
     trimed_stmt = ai_column_stmt;
   }
