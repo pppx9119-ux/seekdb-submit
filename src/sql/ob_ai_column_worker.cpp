@@ -550,11 +550,32 @@ int ObAIColumnWorker::call_model(const ObAIColumnSpec &spec,
         } else if (OB_FAIL(provider->get_body(allocator, request_model, contents, nullptr, body))) {
         } else if (OB_FAIL(client.send_post(allocator, endpoint.get_url(), headers, body, response))) {
         } else if (OB_FAIL(provider->parse_output(allocator, response, result_base))) {
+        } else if (OB_ISNULL(result_base)
+                   || common::ObJsonNodeType::J_ARRAY != result_base->json_type()) {
+          ret = OB_INVALID_DATA;
+        } else if (result_base->element_count() < 1) {
+          ret = OB_INVALID_DATA;
         } else {
-          common::ObString text;
-          if (OB_FAIL(common::ObAIFuncJsonUtils::print_json_to_str(allocator, result_base, text))) {
+          // The provider answers with one embedding per input and this call
+          // sends exactly one input, so the vector of the row is the first
+          // element of the outer array.
+          common::ObIJsonBase *vector_base = nullptr;
+          if (OB_FAIL(result_base->get_array_element(0, vector_base))
+              || OB_ISNULL(vector_base)
+              || common::ObJsonNodeType::J_ARRAY != vector_base->json_type()) {
+            ret = OB_INVALID_DATA;
+          } else if (spec.dimension > 0
+                     && static_cast<int64_t>(vector_base->element_count()) != spec.dimension) {
+            ret = OB_INVALID_DATA;
+            LOG_WARN("the embedding dimension does not match the AI column", K(ret),
+                     "expected", spec.dimension,
+                     "actual", static_cast<int64_t>(vector_base->element_count()));
           } else {
-            value.assign(text.ptr(), static_cast<size_t>(text.length()));
+            common::ObString text;
+            if (OB_FAIL(common::ObAIFuncJsonUtils::print_json_to_str(allocator, vector_base, text))) {
+            } else {
+              value.assign(text.ptr(), static_cast<size_t>(text.length()));
+            }
           }
         }
       } else {
