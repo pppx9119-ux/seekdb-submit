@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL
 #include "config_bridge.h"
 #include "sql/ob_sql.h"
+#include "sql/ob_file_sql_rewriter.h"
 #include "lib/json/ob_json_print_utils.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "query/runtime/ob_query_runtime_environment.h"
@@ -1944,7 +1945,18 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
 
   ObIAllocator &allocator = THIS_WORKER.get_sql_arena_allocator();
   ObSQLSessionInfo &session = result.get_session();
-  
+
+  // File table functions are expanded into an inline derived table before the
+  // statement enters the plan cache, so the parser and optimizer see plain SQL.
+  ObString rewritten_stmt;
+  bool file_sql_rewritten = false;
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(ObFileSqlRewriter::rewrite(allocator, session, trimed_stmt,
+                                                rewritten_stmt, file_sql_rewritten))) {
+  } else if (file_sql_rewritten) {
+    trimed_stmt = rewritten_stmt;
+  }
+
   ObExecContext& ectx = result.get_exec_context();
   int get_plan_err = OB_SUCCESS; //used for judge whether add plan to plan cache
   bool use_plan_cache = session.get_local_ob_enable_plan_cache();

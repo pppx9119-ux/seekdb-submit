@@ -19,6 +19,7 @@ on:
   push:
     branches:
       - feature/ai-functions-v2
+      - feature/seekdb-all-in-one
     paths:
       - '.github/workflows/ci-check.yml'
       - '.github/script/seekdb/ai_mock_service.py'

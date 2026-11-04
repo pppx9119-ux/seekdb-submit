@@ -22,6 +22,7 @@ SQL_UNITY_GROUPS = [
         srcs = [
             "src/sql/ob_end_trans_callback.cpp",
             "src/sql/ob_end_trans_cb_packet_param.cpp",
+            "src/sql/ob_file_sql_rewriter.cpp",
             "src/sql/ob_phy_table_location.cpp",
             "src/sql/ob_query_retry_ctrl.cpp",
             "src/sql/ob_result_set.cpp",
