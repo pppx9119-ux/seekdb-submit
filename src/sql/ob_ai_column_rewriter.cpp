@@ -1138,8 +1138,12 @@ int rewrite_alter_retry(const std::string &sql, const std::vector<Token> &tokens
       } else {
         std::string predicate;
         if (predicate_begin >= 0 && predicate_begin < predicate_end) {
+          // STATUS reads the row's task state: a published value is READY, a
+          // scheduled retry is RETRY, a terminal failure is FAILED, and the
+          // remaining rows still wait for their first answer.
           const std::string status_case =
               std::string("(case when `") + spec->column_name + "` is not null then 'READY' when ("
+              + "(`" + spec->state_column() + "` div 1000) = 3) then 'RETRY' when ("
               + "(`" + spec->state_column() + "` div 1000) = 2) then 'FAILED' else 'PENDING' end)";
           std::string built;
           int64_t pos = tokens.at(static_cast<size_t>(predicate_begin)).begin;
