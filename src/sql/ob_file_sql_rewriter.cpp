@@ -3186,16 +3186,17 @@ static bool path_exists(const std::string &path)
 static std::string csv_field(const std::string &v, const CopyOptions &opts, const bool force_quote)
 {
   const char delimiter = opts.delimiter.empty() ? ',' : opts.delimiter[0];
-  const bool has_quote = !opts.quote.empty();
-  const char quote = has_quote ? opts.quote[0] : '"';
+  // A quote character is always available: without one, a value containing the
+  // delimiter or a newline could not be written so that read_csv returns it.
+  const char quote = opts.quote.empty() ? '"' : opts.quote[0];
   const bool has_escape = !opts.escape.empty();
   const char escape = has_escape ? opts.escape[0] : '\\';
-  bool need_quote = has_quote && (v.empty() || force_quote);
+  bool need_quote = v.empty() || force_quote;
   for (size_t i = 0; !need_quote && i < v.size(); ++i) {
     const char c = v[i];
     if (c == delimiter || c == '\n' || c == '\r') {
       need_quote = true;
-    } else if (has_quote && (c == quote || (has_escape && c == escape))) {
+    } else if (c == quote || (has_escape && c == escape)) {
       need_quote = true;
     }
   }
@@ -3209,11 +3210,11 @@ static std::string csv_field(const std::string &v, const CopyOptions &opts, cons
     if (has_escape && (c == escape || c == quote)) {
       out.push_back(escape);
       out.push_back(c);
-    } else if (!has_escape && c == quote) {
-      // Without an escape character the only portable way to keep a quote
-      // inside a quoted field is to double it.
-      out.push_back(quote);
-      out.push_back(quote);
+    } else if (!has_escape && (c == quote || c == escape)) {
+      // Without a user escape character, double the quote and the reader's
+      // default escape character so both survive a read-back.
+      out.push_back(c);
+      out.push_back(c);
     } else {
       out.push_back(c);
     }
@@ -3420,10 +3421,11 @@ static void append_copy_format(std::string &sql, const CopyOptions &opts)
 {
   sql += " format = (type = 'CSV', field_delimiter = ";
   sql += quote_sql_string(opts.delimiter.empty() ? std::string(",") : opts.delimiter);
-  if (!opts.quote.empty()) {
-    sql += ", field_optionally_enclosed_by = ";
-    sql += quote_sql_string(opts.quote);
-  }
+  // Always enclose fields that need it. Without an enclosing character the
+  // writer cannot represent a string containing the delimiter or a newline,
+  // and the file would no longer read back with read_csv.
+  sql += ", field_optionally_enclosed_by = ";
+  sql += quote_sql_string(opts.quote.empty() ? std::string("\"") : opts.quote);
   if (!opts.escape.empty()) {
     sql += ", escape = ";
     sql += quote_sql_string(opts.escape);
