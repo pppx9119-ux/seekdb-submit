@@ -403,7 +403,13 @@ static bool is_integer_text(const std::string &t)
       return false;
     }
   }
-  return true;
+  // An integer outside the BIGINT range cannot be represented by the inferred
+  // type. Report it as non-integer so it widens to DOUBLE instead of reaching
+  // the engine as a literal it would silently clip.
+  errno = 0;
+  char *end = NULL;
+  ::strtoll(t.c_str(), &end, 10);
+  return 0 == errno && NULL != end && '\0' == *end;
 }
 
 static bool is_double_text(const std::string &t)
@@ -586,6 +592,7 @@ static bool parse_csv_records(const std::string &data,
         cell.is_null = false;
         cell.quoted = true;
         ++i;
+        bool closed = false;
         while (i < n) {
           if (data[i] == quote) {
             if (i + 1 < n && data[i + 1] == quote) {
@@ -593,6 +600,7 @@ static bool parse_csv_records(const std::string &data,
               i += 2;
             } else {
               ++i;
+              closed = true;
               break;
             }
           } else if (has_escape && data[i] == escape && i + 1 < n) {
@@ -610,8 +618,17 @@ static bool parse_csv_records(const std::string &data,
             ++i;
           }
         }
+        if (!closed) {
+          // Unterminated quoted field: report the row instead of quietly
+          // treating the rest of the file as one value.
+          return false;
+        }
         while (i < n && (data[i] == ' ' || data[i] == '\t')) {
           ++i;
+        }
+        if (i < n && data[i] != delimiter && data[i] != '\n' && data[i] != '\r') {
+          // Junk after the closing quote, e.g. "abc"def.
+          return false;
         }
       } else {
         const size_t start = i;
@@ -687,6 +704,18 @@ static bool load_csv_table(const std::string &data, const FileSqlOptions &option
   if (!parse_csv_records(data, options, records)) {
     return false;
   }
+  // A completely empty line is not a row; ignore it as CSV readers do instead
+  // of reporting a one-column record against a wider header.
+  std::vector<CsvRecord> non_blank;
+  non_blank.reserve(records.size());
+  for (size_t r = 0; r < records.size(); ++r) {
+    const bool blank = 1 == records[r].cells.size() && !records[r].cells[0].quoted
+                       && records[r].cells[0].is_null && records[r].cells[0].text.empty();
+    if (!blank) {
+      non_blank.push_back(records[r]);
+    }
+  }
+  records.swap(non_blank);
   bool has_header = false;
   if (1 == options.header) {
     has_header = true;
@@ -696,9 +725,14 @@ static bool load_csv_table(const std::string &data, const FileSqlOptions &option
     has_header = detect_csv_header(records);
   }
   size_t column_count = 0;
-  for (size_t r = 0; r < records.size(); ++r) {
-    if (records[r].cells.size() > column_count) {
-      column_count = records[r].cells.size();
+  if (!records.empty()) {
+    column_count = records[0].cells.size();
+    for (size_t r = 0; r < records.size(); ++r) {
+      if (records[r].cells.size() != column_count) {
+        // Ragged rows are a file defect rather than data: surface them
+        // instead of padding a wrong shape into the result.
+        return false;
+      }
     }
   }
   if (column_count == 0) {
@@ -1429,7 +1463,8 @@ static bool parse_parquet_page_header(CompactReader &r,
                                       int &encoding,
                                       int &def_len,
                                       int &rep_len,
-                                      bool &is_compressed)
+                                      bool &is_compressed,
+                                      int &dict_num_values)
 {
   page_type = -1;
   compressed_size = 0;
@@ -1438,6 +1473,7 @@ static bool parse_parquet_page_header(CompactReader &r,
   def_len = 0;
   rep_len = 0;
   is_compressed = true;
+  dict_num_values = 0;
   int16_t last = 0;
   int16_t id = 0;
   uint8_t ft = 0;
@@ -1457,6 +1493,58 @@ static bool parse_parquet_page_header(CompactReader &r,
         page_type = static_cast<int>(v);
       } else {
         compressed_size = static_cast<int>(v);
+      }
+    } else if (5 == id) {
+      // DataPageHeader (v1): NumValues, Encoding, DefinitionLevelEncoding,
+      // RepetitionLevelEncoding, Statistics. The level encodings are always
+      // RLE/bit-packed for the files this reader accepts.
+      int16_t dlast = 0;
+      int16_t did = 0;
+      uint8_t dft = 0;
+      for (;;) {
+        if (!r.field_header(did, dft, dlast)) {
+          return false;
+        }
+        if (dft == 0) {
+          break;
+        }
+        if (1 == did || 2 == did) {
+          int64_t v = 0;
+          if (!r.zigzag(v)) {
+            return false;
+          }
+          if (1 == did) {
+            num_values = static_cast<int>(v);
+          } else {
+            encoding = static_cast<int>(v);
+          }
+        } else if (!r.skip(dft)) {
+          return false;
+        }
+      }
+    } else if (7 == id) {
+      // DictionaryPageHeader: NumValues, Encoding, IsSorted.
+      int16_t dlast = 0;
+      int16_t did = 0;
+      uint8_t dft = 0;
+      for (;;) {
+        if (!r.field_header(did, dft, dlast)) {
+          return false;
+        }
+        if (dft == 0) {
+          break;
+        }
+        if (1 == did || 2 == did) {
+          int64_t v = 0;
+          if (!r.zigzag(v)) {
+            return false;
+          }
+          if (1 == did) {
+            dict_num_values = static_cast<int>(v);
+          }
+        } else if (!r.skip(dft)) {
+          return false;
+        }
       }
     } else if (8 == id) {
       int16_t dlast = 0;
@@ -1757,6 +1845,109 @@ static bool decode_plain_cell(const int physical,
   return true;
 }
 
+// Expand the body of one data page into cells. Dictionary indices use the
+// RLE/bit-packed hybrid layout, so a page of indices is decoded in one pass and
+// then looked up in the dictionary loaded from the preceding dictionary page.
+static bool decode_parquet_page_values(const int physical,
+                                       const int encoding,
+                                       const std::string &values,
+                                       const std::vector<int> &defs,
+                                       const int max_def,
+                                       const std::vector<FileSqlCell> &dict,
+                                       std::vector<FileSqlCell> &cells)
+{
+  bool ok = true;
+  const int count = static_cast<int>(defs.size());
+  const FileSqlType type = parquet_type(physical);
+  cells.clear();
+  cells.reserve(static_cast<size_t>(count));
+  if (0 == encoding) {
+    size_t vi = 0;
+    size_t value_index = 0;
+    for (int k = 0; ok && k < count; ++k) {
+      FileSqlCell cell;
+      if (max_def > 0 && defs[k] != max_def) {
+        cell.is_null = true;
+      } else if (decode_plain_cell(physical, values, vi, value_index, cell)) {
+        cell.type = type;
+        ++value_index;
+      } else {
+        ok = false;
+      }
+      if (ok) {
+        cells.push_back(cell);
+      }
+    }
+  } else if (2 == encoding || 8 == encoding) {
+    int non_null = 0;
+    for (int k = 0; k < count; ++k) {
+      if (max_def <= 0 || defs[k] == max_def) {
+        ++non_null;
+      }
+    }
+    std::vector<int> indices;
+    if (non_null > 0) {
+      if (values.empty()) {
+        ok = false;
+      } else {
+        const int index_width = static_cast<int>(static_cast<unsigned char>(values[0]));
+        ok = decode_levels(reinterpret_cast<const unsigned char *>(values.data()) + 1,
+                           values.size() - 1, non_null, index_width, indices);
+      }
+    }
+    size_t next_index = 0;
+    for (int k = 0; ok && k < count; ++k) {
+      FileSqlCell cell;
+      if (max_def > 0 && defs[k] != max_def) {
+        cell.is_null = true;
+      } else if (next_index >= indices.size() || indices[next_index] < 0
+                 || static_cast<size_t>(indices[next_index]) >= dict.size()) {
+        ok = false;
+      } else {
+        cell = dict[static_cast<size_t>(indices[next_index])];
+        cell.type = type;
+        ++next_index;
+      }
+      if (ok) {
+        cells.push_back(cell);
+      }
+    }
+  } else {
+    // Only PLAIN and dictionary-encoded pages are supported; reject the page
+    // instead of returning values decoded with the wrong layout.
+    ok = false;
+  }
+  return ok;
+}
+
+static bool decode_parquet_dictionary(const unsigned char *data,
+                                      const size_t len,
+                                      const bool compressed,
+                                      const int physical,
+                                      const int count,
+                                      std::vector<FileSqlCell> &dict)
+{
+  bool ok = true;
+  dict.clear();
+  std::string plain;
+  if (compressed && len > 0) {
+    ok = snappy_decompress(data, len, plain);
+  } else if (len > 0) {
+    plain.assign(reinterpret_cast<const char *>(data), len);
+  }
+  size_t vi = 0;
+  for (int k = 0; ok && k < count; ++k) {
+    FileSqlCell cell;
+    if (!decode_plain_cell(physical, plain, vi, static_cast<size_t>(k), cell)) {
+      ok = false;
+    } else {
+      cell.type = parquet_type(physical);
+      dict.push_back(cell);
+    }
+  }
+  return ok;
+}
+
 static bool decode_parquet_column(const std::string &file,
                                   const ParquetColumnChunk &chunk,
                                   const int max_def,
@@ -1765,6 +1956,11 @@ static bool decode_parquet_column(const std::string &file,
   cells.clear();
   if (chunk.num_values <= 0) {
     return true;
+  }
+  if (chunk.codec != 0 && chunk.codec != 1) {
+    // 0: uncompressed, 1: snappy. Other codecs need a decompressor that is not
+    // part of this reader, so the column cannot be decoded correctly.
+    return false;
   }
   size_t pos = static_cast<size_t>(chunk.data_page_offset);
   if (chunk.dictionary_page_offset >= 0 &&
@@ -1778,6 +1974,7 @@ static bool decode_parquet_column(const std::string &file,
   for (int m = max_def; m > 0; m >>= 1) {
     ++bit_width;
   }
+  std::vector<FileSqlCell> dict;
   while (pos < file_size && produced < chunk.num_values) {
     CompactReader r(base + pos, file_size - pos);
     int page_type = -1;
@@ -1787,16 +1984,62 @@ static bool decode_parquet_column(const std::string &file,
     int def_len = 0;
     int rep_len = 0;
     bool is_compressed = true;
+    int dict_num_values = 0;
     if (!parse_parquet_page_header(r, page_type, compressed_size, num_values,
-                                   encoding, def_len, rep_len, is_compressed)) {
+                                   encoding, def_len, rep_len, is_compressed,
+                                   dict_num_values)) {
       return false;
     }
     const size_t header_len = r.i;
-    if (pos + header_len + static_cast<size_t>(compressed_size) > file_size) {
+    if (compressed_size < 0 ||
+        pos + header_len + static_cast<size_t>(compressed_size) > file_size) {
       return false;
     }
-    if (3 == page_type && num_values > 0) {
-      const unsigned char *payload = base + pos + header_len;
+    const unsigned char *payload = base + pos + header_len;
+    if (2 == page_type && dict_num_values > 0) {
+      if (!decode_parquet_dictionary(payload, static_cast<size_t>(compressed_size),
+                                     chunk.codec != 0, chunk.type, dict_num_values,
+                                     dict)) {
+        return false;
+      }
+    } else if (0 == page_type && num_values > 0) {
+      // Data page v1: repetition levels (none for flat columns), definition
+      // levels prefixed with their byte length, then the values.
+      std::vector<int> defs;
+      size_t offset = 0;
+      if (max_def > 0) {
+        if (compressed_size < 4) {
+          return false;
+        }
+        const uint32_t def_bytes = read_le32(payload);
+        if (4 + static_cast<size_t>(def_bytes) > static_cast<size_t>(compressed_size)) {
+          return false;
+        }
+        if (!decode_levels(payload + 4, static_cast<size_t>(def_bytes), num_values,
+                           bit_width, defs)) {
+          return false;
+        }
+        offset = 4 + static_cast<size_t>(def_bytes);
+      } else {
+        defs.assign(num_values, 0);
+      }
+      const size_t values_len = static_cast<size_t>(compressed_size) - offset;
+      std::string values;
+      if (chunk.codec != 0 && values_len > 0) {
+        if (!snappy_decompress(payload + offset, values_len, values)) {
+          return false;
+        }
+      } else {
+        values.assign(reinterpret_cast<const char *>(payload + offset), values_len);
+      }
+      std::vector<FileSqlCell> page_cells;
+      if (!decode_parquet_page_values(chunk.type, encoding, values, defs, max_def,
+                                      dict, page_cells)) {
+        return false;
+      }
+      cells.insert(cells.end(), page_cells.begin(), page_cells.end());
+      produced += num_values;
+    } else if (3 == page_type && num_values > 0) {
       if (rep_len < 0 || def_len < 0 || rep_len + def_len > compressed_size) {
         return false;
       }
@@ -1811,7 +2054,7 @@ static bool decode_parquet_column(const std::string &file,
       }
       const int values_len = compressed_size - rep_len - def_len;
       std::string values;
-      if (is_compressed && values_len > 0) {
+      if (is_compressed && chunk.codec != 0 && values_len > 0) {
         if (!snappy_decompress(payload + rep_len + def_len,
                                static_cast<size_t>(values_len), values)) {
           return false;
@@ -1820,31 +2063,17 @@ static bool decode_parquet_column(const std::string &file,
         values.assign(reinterpret_cast<const char *>(payload + rep_len + def_len),
                       static_cast<size_t>(values_len));
       }
-      size_t vi = 0;
-      size_t value_index = 0;
-      for (int k = 0; k < num_values; ++k) {
-        FileSqlCell cell;
-        if (max_def > 0 && defs[k] != max_def) {
-          cell.is_null = true;
-          cell.type = FILE_SQL_NULL;
-        } else {
-          if (!decode_plain_cell(chunk.type, values, vi, value_index, cell)) {
-            return false;
-          }
-          if (max_def > 0) {
-            cell.type = parquet_type(chunk.type);
-          } else {
-            cell.type = parquet_type(chunk.type);
-          }
-        }
-        ++value_index;
-        cells.push_back(cell);
-        ++produced;
+      std::vector<FileSqlCell> page_cells;
+      if (!decode_parquet_page_values(chunk.type, encoding, values, defs, max_def,
+                                      dict, page_cells)) {
+        return false;
       }
+      cells.insert(cells.end(), page_cells.begin(), page_cells.end());
+      produced += num_values;
     }
     pos += header_len + static_cast<size_t>(compressed_size);
   }
-  return true;
+  return produced >= chunk.num_values;
 }
 
 static bool load_parquet_table(const std::string &path, FileSqlTable &table)
@@ -1865,7 +2094,10 @@ static bool load_parquet_table(const std::string &path, FileSqlTable &table)
   const size_t footer_start = file.size() - 8 - static_cast<size_t>(footer_len);
   CompactReader r(base + footer_start, footer_len);
   std::vector<ParquetSchemaElement> schema;
-  std::vector<ParquetColumnChunk> chunks;
+  // A file may contain several row groups; each group stores one chunk per
+  // leaf column. Keep the groups apart so the rows are concatenated in file
+  // order instead of silently reading only the first group.
+  std::vector<std::vector<ParquetColumnChunk> > row_groups;
   int16_t last = 0;
   int16_t id = 0;
   uint8_t ft = 0;
@@ -1896,6 +2128,7 @@ static bool load_parquet_table(const std::string &path, FileSqlTable &table)
         return false;
       }
       for (int32_t k = 0; k < sz; ++k) {
+        std::vector<ParquetColumnChunk> group;
         int16_t rlast = 0;
         int16_t rid = 0;
         uint8_t rft = 0;
@@ -1917,12 +2150,13 @@ static bool load_parquet_table(const std::string &path, FileSqlTable &table)
               if (!parse_parquet_column_chunk(r, chunk)) {
                 return false;
               }
-              chunks.push_back(chunk);
+              group.push_back(chunk);
             }
           } else if (!r.skip(rft)) {
             return false;
           }
         }
+        row_groups.push_back(group);
       }
     } else if (!r.skip(ft)) {
       return false;
@@ -1935,6 +2169,11 @@ static bool load_parquet_table(const std::string &path, FileSqlTable &table)
     }
   }
   for (size_t c = 0; c < leaves.size(); ++c) {
+    if (2 == schema[leaves[c]].repetition) {
+      // Repeated primitive columns need repetition-level handling that this
+      // flat reader does not provide.
+      return false;
+    }
     FileSqlColumn column;
     column.name = schema[leaves[c]].name;
     column.type = parquet_type(schema[leaves[c]].type);
@@ -1947,13 +2186,16 @@ static bool load_parquet_table(const std::string &path, FileSqlTable &table)
   std::vector<std::vector<FileSqlCell> > columns_data;
   columns_data.resize(leaves.size());
   for (size_t c = 0; c < leaves.size(); ++c) {
-    if (chunks.empty()) {
-      return false;
-    }
-    const size_t chunk_index = (chunks.size() == leaves.size()) ? c : 0;
     const int max_def = schema[leaves[c]].repetition == 1 ? 1 : 0;
-    if (!decode_parquet_column(file, chunks[chunk_index], max_def, columns_data[c])) {
-      return false;
+    for (size_t g = 0; g < row_groups.size(); ++g) {
+      if (row_groups[g].size() != leaves.size()) {
+        return false;
+      }
+      std::vector<FileSqlCell> group_cells;
+      if (!decode_parquet_column(file, row_groups[g][c], max_def, group_cells)) {
+        return false;
+      }
+      columns_data[c].insert(columns_data[c].end(), group_cells.begin(), group_cells.end());
     }
   }
   size_t row_count = 0;
@@ -2150,7 +2392,9 @@ static int parse_file_arguments(const std::string &func_name,
         ret = OB_NOT_SUPPORTED;
       } else {
         const long long n = ::strtoll(val.c_str(), NULL, 10);
-        if (n > 0 || n < -1) {
+        // Only -1 (scan the whole file) is supported; any other value would
+        // change how types are inferred and is rejected rather than ignored.
+        if (-1 != n) {
           ret = OB_NOT_SUPPORTED;
         }
       }
@@ -2230,8 +2474,19 @@ static int load_file_table(const std::string &path, const FileSqlCall &call, Fil
     if (!read_whole_file(path, data)) {
       ret = OB_ERR_PARSE_SQL;
     } else if (FILE_SQL_CSV == call.kind) {
+      // A UTF-8 BOM is an encoding marker, not part of the first header name.
+      if (data.size() >= 3 && 0xEF == static_cast<unsigned char>(data[0])
+          && 0xBB == static_cast<unsigned char>(data[1])
+          && 0xBF == static_cast<unsigned char>(data[2])) {
+        data.erase(0, 3);
+      }
       ok = load_csv_table(data, call.options, table);
     } else if (FILE_SQL_JSON == call.kind) {
+      if (data.size() >= 3 && 0xEF == static_cast<unsigned char>(data[0])
+          && 0xBB == static_cast<unsigned char>(data[1])
+          && 0xBF == static_cast<unsigned char>(data[2])) {
+        data.erase(0, 3);
+      }
       ok = load_json_table(data, table);
     }
     if (OB_SUCCESS == ret && !ok) {
@@ -3129,9 +3384,28 @@ static int build_copy_outfile(const ObSQLSessionInfo &session,
   } else {
     size_t first = 0;
     std::string word;
-    const bool is_query = read_identifier_token(select_sql, first, word)
-                          && (equal_ci(word, "select") || equal_ci(word, "with")
-                              || equal_ci(word, "values") || equal_ci(word, "table"));
+    bool is_query = false;
+    if (!read_identifier_token(select_sql, first, word)) {
+      // Not an identifier: fall through to the table-reference check below.
+    } else if (equal_ci(word, "select") || equal_ci(word, "values")) {
+      is_query = true;
+    } else if (equal_ci(word, "table")) {
+      // DuckDB's TABLE t shorthand: only valid as a query in its own dialect,
+      // so answer it with the equivalent SELECT.
+      select_sql = "select * from " + trim(select_sql.substr(first));
+      is_query = true;
+    } else if (equal_ci(word, "with")) {
+      // The select_into production does not accept a WITH clause before its
+      // INTO clause, so nest the query instead of appending it directly.
+      select_sql = "select * from (" + select_sql + ") __ob_file_sql_copy";
+      is_query = true;
+    }
+    if (!is_query && !select_sql.empty() && '(' == select_sql[0]) {
+      // A parenthesised query expression is not accepted where a table name is
+      // expected, so make it the derived table of a plain SELECT.
+      select_sql = "select * from (" + select_sql + ") __ob_file_sql_copy";
+      is_query = true;
+    }
     if (is_query) {
       // keep the query text as written
     } else if (!is_table_reference(select_sql)) {

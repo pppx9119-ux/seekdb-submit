@@ -950,11 +950,25 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
 {
   int ret = OB_SUCCESS;
   char char_n = 'N';
-  const bool need_enclose = has_enclose_ && !obj.is_null()
-                            && (!is_optional_ || obj.is_string_type() || obj.is_collection_sql_type()
-                                || obj.is_json() || obj.is_geometry() || obj.is_date()
-                                || obj.is_time() || obj.is_timestamp() || obj.is_datetime()
-                                || obj.is_mysql_date() || obj.is_mysql_datetime());
+  // A text value that is empty or spells the NULL marker must be enclosed:
+  // otherwise reading the file back turns it into a NULL, losing data.
+  bool force_enclose = false;
+  if (has_enclose_ && !obj.is_null() && obj.is_string_type()) {
+    const ObString str = obj.get_varchar();
+    if (str.empty()) {
+      force_enclose = true;
+    } else if (!MY_SPEC.external_properties_.str_.empty()
+               && external_properties_.csv_format_.null_if_.count() > 0
+               && str == external_properties_.csv_format_.null_if_.at(0)) {
+      force_enclose = true;
+    }
+  }
+  const bool need_enclose = force_enclose
+                            || (has_enclose_ && !obj.is_null()
+                                && (!is_optional_ || obj.is_string_type() || obj.is_collection_sql_type()
+                                    || obj.is_json() || obj.is_geometry() || obj.is_date()
+                                    || obj.is_time() || obj.is_timestamp() || obj.is_datetime()
+                                    || obj.is_mysql_date() || obj.is_mysql_datetime()));
   if (need_enclose) {
     OZ(write_single_char_to_file(&char_enclose_, data_writer));
   }
