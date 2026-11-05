@@ -294,7 +294,7 @@ void ObAIColumnWorker::tick()
     }
   }
   for (size_t i = 0; i < entries.size() && !stopping_.load(); ++i) {
-    const int ret = process_table(entries.at(i));
+    int ret = process_table(entries.at(i));
     if (OB_FAIL(ret)) {
       LOG_WARN("failed to process an AI column table", K(ret), "db", entries.at(i).db.c_str(),
                "table", entries.at(i).table.c_str());
