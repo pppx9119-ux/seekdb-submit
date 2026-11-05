@@ -42,6 +42,12 @@ namespace sql
 namespace file_sql_impl
 {
 
+// A file is expanded into one SELECT branch per row, so the rewritten text
+// grows with the row count. Bound the bytes this reader will hold for a single
+// file: a larger scan would exhaust memory in the parser anyway, and a clear
+// error is better than an allocation failure.
+static const size_t FILE_SQL_MAX_MATERIALIZED_BYTES = 128 * 1024 * 1024;
+
 enum FileSqlType
 {
   FILE_SQL_NULL = 0,
@@ -457,18 +463,40 @@ static bool is_date_text(const std::string &t)
       return false;
     }
   }
+  const int year = (t[0] - '0') * 1000 + (t[1] - '0') * 100 + (t[2] - '0') * 10 + (t[3] - '0');
   const int month = (t[5] - '0') * 10 + (t[6] - '0');
   const int day = (t[8] - '0') * 10 + (t[9] - '0');
-  return month >= 1 && month <= 12 && day >= 1 && day <= 31;
+  if (month < 1 || month > 12 || day < 1) {
+    return false;
+  }
+  static const int month_days[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  int max_day = month_days[month - 1];
+  const bool leap = (0 == year % 4 && 0 != year % 100) || 0 == year % 400;
+  if (2 == month && leap) {
+    max_day = 29;
+  }
+  return day <= max_day;
 }
 
 static bool is_datetime_text(const std::string &t)
 {
-  if (t.size() != 19 || (t[10] != ' ' && t[10] != 'T') || t[13] != ':' || t[16] != ':') {
+  // Accept a fractional seconds part as well as the plain second precision so
+  // timestamps written by other tools keep their DATETIME type.
+  size_t second_end = 19;
+  if (t.size() > 19 && '.' == t[19]) {
+    second_end = 20;
+    while (second_end < t.size() && t[second_end] >= '0' && t[second_end] <= '9') {
+      ++second_end;
+    }
+    if (second_end == 20) {
+      return false;
+    }
+  }
+  if (t.size() != second_end || (t[10] != ' ' && t[10] != 'T') || t[13] != ':' || t[16] != ':') {
     return false;
   }
-  for (size_t i = 0; i < t.size(); ++i) {
-    if (i == 4 || i == 7 || i == 10 || i == 13 || i == 16) {
+  for (size_t i = 0; i < second_end; ++i) {
+    if (i == 4 || i == 7 || i == 10 || i == 13 || i == 16 || i == 19) {
       continue;
     }
     if (t[i] < '0' || t[i] > '9') {
@@ -543,7 +571,8 @@ static bool read_whole_file(const std::string &path, std::string &data)
   if (NULL != fp) {
     if (0 == ::fseek(fp, 0, SEEK_END)) {
       const long len = ::ftell(fp);
-      if (len >= 0 && 0 == ::fseek(fp, 0, SEEK_SET)) {
+      if (len >= 0 && static_cast<size_t>(len) <= FILE_SQL_MAX_MATERIALIZED_BYTES
+          && 0 == ::fseek(fp, 0, SEEK_SET)) {
         data.resize(static_cast<size_t>(len));
         if (len == 0 || ::fread(&data[0], 1, static_cast<size_t>(len), fp) == static_cast<size_t>(len)) {
           ok = true;
@@ -671,11 +700,17 @@ static bool parse_csv_records(const std::string &data,
 
 static bool looks_like_identifier(const std::string &t)
 {
-  if (t.empty() || !is_ident_start(t[0])) {
+  // Header names are frequently UTF-8 (for example Chinese column names), so
+  // any non-ASCII byte is accepted as part of a word here even though the SQL
+  // tokenizer only handles ASCII identifiers.
+  const bool start_ok = !t.empty()
+                        && (is_ident_start(t[0]) || static_cast<unsigned char>(t[0]) >= 0x80);
+  if (!start_ok) {
     return false;
   }
   for (size_t i = 1; i < t.size(); ++i) {
-    if (!is_ident_char(t[i])) {
+    const unsigned char c = static_cast<unsigned char>(t[i]);
+    if (!is_ident_char(t[i]) && c < 0x80) {
       return false;
     }
   }
@@ -1675,6 +1710,11 @@ static bool snappy_decompress(const unsigned char *in, const size_t in_len, std:
       return false;
     }
   }
+  if (expected > FILE_SQL_MAX_MATERIALIZED_BYTES) {
+    // A corrupted header could claim an enormous expansion; refuse it here
+    // instead of letting reserve() exhaust memory.
+    return false;
+  }
   out.reserve(static_cast<size_t>(expected));
   while (i < in_len) {
     const uint8_t tag = in[i++];
@@ -1807,7 +1847,7 @@ static bool decode_plain_cell(const int physical,
       vi += 4;
       float f = 0.0f;
       ::memcpy(&f, &bits, sizeof(f));
-      ::snprintf(buf, sizeof(buf), "%g", static_cast<double>(f));
+      ::snprintf(buf, sizeof(buf), "%.9g", static_cast<double>(f));
       cell.is_null = false;
       cell.text = buf;
       break;
@@ -1991,8 +2031,10 @@ static bool decode_parquet_column(const std::string &file,
       return false;
     }
     const size_t header_len = r.i;
-    if (compressed_size < 0 ||
-        pos + header_len + static_cast<size_t>(compressed_size) > file_size) {
+    if (compressed_size < 0
+        || num_values < 0
+        || static_cast<int64_t>(num_values) > chunk.num_values
+        || pos + header_len + static_cast<size_t>(compressed_size) > file_size) {
       return false;
     }
     const unsigned char *payload = base + pos + header_len;
@@ -2268,6 +2310,17 @@ static std::string strip_trailing_slash(const std::string &s)
   return out;
 }
 
+static bool path_within(const char *path, const char *root)
+{
+  const std::string p(path);
+  const std::string r(root);
+  bool within = p.size() >= r.size() && p.compare(0, r.size(), r) == 0;
+  if (within && p.size() > r.size() && '/' != r[r.size() - 1] && '/' != p[r.size()]) {
+    within = false;
+  }
+  return within;
+}
+
 static bool path_allowed(const ObSQLSessionInfo &session, const std::string &path)
 {
   common::ObString priv;
@@ -2275,28 +2328,32 @@ static bool path_allowed(const ObSQLSessionInfo &session, const std::string &pat
   if (OB_SUCCESS == session.get_secure_file_priv(priv) && !priv.empty()) {
     const std::string p = trim(std::string(priv.ptr(), static_cast<size_t>(priv.length())));
     if (!p.empty() && p != "/") {
-      std::string dir = path;
-      const size_t wildcard = dir.find_first_of("*?[");
-      if (std::string::npos != wildcard) {
-        dir = dir.substr(0, wildcard);
-      }
-      const size_t slash = dir.find_last_of('/');
-      dir = (std::string::npos == slash) ? "." : dir.substr(0, slash + 1);
+      const size_t wildcard = path.find_first_of("*?[");
+      const bool exact = std::string::npos == wildcard;
       char resolved[PATH_MAX];
       char resolved_priv[PATH_MAX];
-      const std::string dir_trim = strip_trailing_slash(dir);
       const std::string priv_trim = strip_trailing_slash(p);
-      if (NULL == ::realpath(dir_trim.c_str(), resolved) ||
-          NULL == ::realpath(priv_trim.c_str(), resolved_priv)) {
+      if (NULL == ::realpath(priv_trim.c_str(), resolved_priv)) {
         allowed = false;
+      } else if (exact && NULL != ::realpath(path.c_str(), resolved)) {
+        // Resolve the file itself, not just its directory, so a symbolic link
+        // inside the allowed directory cannot read a file outside of it.
+        allowed = path_within(resolved, resolved_priv);
       } else {
-        const std::string r(resolved);
-        const std::string rp(resolved_priv);
-        bool prefix = r.size() >= rp.size() && r.compare(0, rp.size(), rp) == 0;
-        if (prefix && r.size() > rp.size() && rp != "/" && r[rp.size()] != '/') {
-          prefix = false;
+        // Glob patterns and COPY targets that do not exist yet are checked
+        // through their parent directory.
+        std::string dir = path;
+        if (!exact) {
+          dir = dir.substr(0, wildcard);
         }
-        allowed = prefix;
+        const size_t slash = dir.find_last_of('/');
+        dir = (std::string::npos == slash) ? "." : dir.substr(0, slash + 1);
+        const std::string dir_trim = strip_trailing_slash(dir);
+        if (NULL == ::realpath(dir_trim.c_str(), resolved)) {
+          allowed = false;
+        } else {
+          allowed = path_within(resolved, resolved_priv);
+        }
       }
     }
   }
@@ -2318,12 +2375,13 @@ struct FileSqlCall
 static bool is_file_function_name(const std::string &name, FileSqlKind &kind)
 {
   bool found = true;
-  if (equal_ci(name, "read_csv")) {
+  if (equal_ci(name, "read_csv") || equal_ci(name, "read_csv_auto")) {
     kind = FILE_SQL_CSV;
-  } else if (equal_ci(name, "read_json") || equal_ci(name, "read_ndjson") ||
-             equal_ci(name, "read_jsonl")) {
+  } else if (equal_ci(name, "read_json") || equal_ci(name, "read_json_auto")
+             || equal_ci(name, "read_ndjson") || equal_ci(name, "read_ndjson_auto")
+             || equal_ci(name, "read_jsonl")) {
     kind = FILE_SQL_JSON;
-  } else if (equal_ci(name, "read_parquet")) {
+  } else if (equal_ci(name, "read_parquet") || equal_ci(name, "read_parquet_auto")) {
     kind = FILE_SQL_PARQUET;
   } else if (equal_ci(name, "glob")) {
     kind = FILE_SQL_GLOB;
@@ -2549,8 +2607,12 @@ static std::string cell_sql(const FileSqlCell &cell, const FileSqlType column_ty
   return out;
 }
 
-static void materialize_table(const FileSqlTable &table, std::string &out)
+// A file is expanded into one SELECT branch per row, so its rewritten text
+// grows with the row count. Bound that text: a scan this large would exhaust
+// memory in the parser anyway, and a clear error is better than an OOM.
+static bool materialize_table(const FileSqlTable &table, std::string &out)
 {
+  bool ok = true;
   out.clear();
   out += "(";
   if (table.columns.empty() || table.rows.empty()) {
@@ -2568,22 +2630,28 @@ static void materialize_table(const FileSqlTable &table, std::string &out)
     }
     out += " from dual where 1 = 0)";
   } else {
-    for (size_t r = 0; r < table.rows.size(); ++r) {
+    for (size_t r = 0; ok && r < table.rows.size(); ++r) {
       if (r > 0) {
         out += " union all ";
       }
       out += "select ";
-      for (size_t c = 0; c < table.columns.size(); ++c) {
+      for (size_t c = 0; ok && c < table.columns.size(); ++c) {
         if (c > 0) {
           out += ", ";
         }
         out += cell_sql(table.rows[r][c], table.columns[c].type);
-        out += " as ";
-        out += quote_ident(table.columns[c].name);
+        // Only the first branch of the union names the columns; repeating the
+        // aliases for every row would needlessly inflate the rewritten text.
+        if (0 == r) {
+          out += " as ";
+          out += quote_ident(table.columns[c].name);
+        }
       }
+      ok = out.size() <= FILE_SQL_MAX_MATERIALIZED_BYTES;
     }
     out += ")";
   }
+  return ok;
 }
 
 static bool is_clause_keyword(const std::string &word)
@@ -2688,7 +2756,10 @@ static int rewrite_file_functions(const ObSQLSessionInfo &session,
       break;
     }
     std::string materialized;
-    materialize_table(table, materialized);
+    if (!materialize_table(table, materialized)) {
+      ret = OB_SIZE_OVERFLOW;
+      break;
+    }
     output.append(input, copied, name_start - copied);
     output += materialized;
     if (!has_table_alias(input, close + 1)) {
