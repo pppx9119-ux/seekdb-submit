@@ -42,6 +42,12 @@ namespace sql
 namespace file_sql_impl
 {
 
+// A file is expanded into one SELECT branch per row, so the rewritten text
+// grows with the row count. Bound the bytes this reader will hold for a single
+// file: a larger scan would exhaust memory in the parser anyway, and a clear
+// error is better than an allocation failure.
+static const size_t FILE_SQL_MAX_MATERIALIZED_BYTES = 128 * 1024 * 1024;
+
 enum FileSqlType
 {
   FILE_SQL_NULL = 0,
@@ -86,10 +92,24 @@ struct FileSqlTable
 
 struct FileSqlOptions
 {
-  FileSqlOptions() : header(0), has_format(false) {}
+  FileSqlOptions()
+      : header(0),
+        has_format(false),
+        has_delimiter(false),
+        has_quote(false),
+        has_escape(false),
+        has_nullstr(false) {}
   int header; // 0: auto, 1: header present, 2: no header
   bool has_format;
   std::string format;
+  bool has_delimiter;
+  std::string delimiter;
+  bool has_quote;
+  std::string quote;
+  bool has_escape;
+  std::string escape;
+  bool has_nullstr;
+  std::string nullstr;
 };
 
 static bool is_ident_start(const char c)
@@ -389,7 +409,13 @@ static bool is_integer_text(const std::string &t)
       return false;
     }
   }
-  return true;
+  // An integer outside the BIGINT range cannot be represented by the inferred
+  // type. Report it as non-integer so it widens to DOUBLE instead of reaching
+  // the engine as a literal it would silently clip.
+  errno = 0;
+  char *end = NULL;
+  ::strtoll(t.c_str(), &end, 10);
+  return 0 == errno && NULL != end && '\0' == *end;
 }
 
 static bool is_double_text(const std::string &t)
@@ -437,18 +463,40 @@ static bool is_date_text(const std::string &t)
       return false;
     }
   }
+  const int year = (t[0] - '0') * 1000 + (t[1] - '0') * 100 + (t[2] - '0') * 10 + (t[3] - '0');
   const int month = (t[5] - '0') * 10 + (t[6] - '0');
   const int day = (t[8] - '0') * 10 + (t[9] - '0');
-  return month >= 1 && month <= 12 && day >= 1 && day <= 31;
+  if (month < 1 || month > 12 || day < 1) {
+    return false;
+  }
+  static const int month_days[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  int max_day = month_days[month - 1];
+  const bool leap = (0 == year % 4 && 0 != year % 100) || 0 == year % 400;
+  if (2 == month && leap) {
+    max_day = 29;
+  }
+  return day <= max_day;
 }
 
 static bool is_datetime_text(const std::string &t)
 {
-  if (t.size() != 19 || (t[10] != ' ' && t[10] != 'T') || t[13] != ':' || t[16] != ':') {
+  // Accept a fractional seconds part as well as the plain second precision so
+  // timestamps written by other tools keep their DATETIME type.
+  size_t second_end = 19;
+  if (t.size() > 19 && '.' == t[19]) {
+    second_end = 20;
+    while (second_end < t.size() && t[second_end] >= '0' && t[second_end] <= '9') {
+      ++second_end;
+    }
+    if (second_end == 20) {
+      return false;
+    }
+  }
+  if (t.size() != second_end || (t[10] != ' ' && t[10] != 'T') || t[13] != ':' || t[16] != ':') {
     return false;
   }
-  for (size_t i = 0; i < t.size(); ++i) {
-    if (i == 4 || i == 7 || i == 10 || i == 13 || i == 16) {
+  for (size_t i = 0; i < second_end; ++i) {
+    if (i == 4 || i == 7 || i == 10 || i == 13 || i == 16 || i == 19) {
       continue;
     }
     if (t[i] < '0' || t[i] > '9') {
@@ -523,7 +571,8 @@ static bool read_whole_file(const std::string &path, std::string &data)
   if (NULL != fp) {
     if (0 == ::fseek(fp, 0, SEEK_END)) {
       const long len = ::ftell(fp);
-      if (len >= 0 && 0 == ::fseek(fp, 0, SEEK_SET)) {
+      if (len >= 0 && static_cast<size_t>(len) <= FILE_SQL_MAX_MATERIALIZED_BYTES
+          && 0 == ::fseek(fp, 0, SEEK_SET)) {
         data.resize(static_cast<size_t>(len));
         if (len == 0 || ::fread(&data[0], 1, static_cast<size_t>(len), fp) == static_cast<size_t>(len)) {
           ok = true;
@@ -548,30 +597,42 @@ struct CsvRecord
   std::vector<FileSqlCell> cells;
 };
 
-static bool parse_csv_records(const std::string &data, std::vector<CsvRecord> &records)
+static bool parse_csv_records(const std::string &data,
+                              const FileSqlOptions &options,
+                              std::vector<CsvRecord> &records)
 {
   records.clear();
   const size_t n = data.size();
+  const char delimiter = (options.has_delimiter && !options.delimiter.empty())
+                             ? options.delimiter[0] : ',';
+  const char quote = (options.has_quote && !options.quote.empty())
+                         ? options.quote[0] : '"';
+  const char escape = (options.has_escape && !options.escape.empty())
+                          ? options.escape[0] : '\\';
+  const bool has_quote = !(options.has_quote && options.quote.empty());
+  const bool has_escape = !(options.has_escape && options.escape.empty());
   size_t i = 0;
   while (i < n) {
     CsvRecord record;
     bool line_done = false;
     while (!line_done) {
       FileSqlCell cell;
-      if (i < n && data[i] == '"') {
+      if (i < n && has_quote && data[i] == quote) {
         cell.is_null = false;
         cell.quoted = true;
         ++i;
+        bool closed = false;
         while (i < n) {
-          if (data[i] == '"') {
-            if (i + 1 < n && data[i + 1] == '"') {
-              cell.text.push_back('"');
+          if (data[i] == quote) {
+            if (i + 1 < n && data[i + 1] == quote) {
+              cell.text.push_back(quote);
               i += 2;
             } else {
               ++i;
+              closed = true;
               break;
             }
-          } else if (data[i] == '\\' && i + 1 < n) {
+          } else if (has_escape && data[i] == escape && i + 1 < n) {
             const char e = data[i + 1];
             i += 2;
             switch (e) {
@@ -586,22 +647,39 @@ static bool parse_csv_records(const std::string &data, std::vector<CsvRecord> &r
             ++i;
           }
         }
+        if (!closed) {
+          // Unterminated quoted field: report the row instead of quietly
+          // treating the rest of the file as one value.
+          return false;
+        }
         while (i < n && (data[i] == ' ' || data[i] == '\t')) {
           ++i;
         }
+        if (i < n && data[i] != delimiter && data[i] != '\n' && data[i] != '\r') {
+          // Junk after the closing quote, e.g. "abc"def.
+          return false;
+        }
       } else {
         const size_t start = i;
-        while (i < n && data[i] != ',' && data[i] != '\n' && data[i] != '\r') {
+        while (i < n && data[i] != delimiter && data[i] != '\n' && data[i] != '\r') {
           ++i;
         }
         cell.text.assign(data, start, i - start);
         cell.is_null = cell.text.empty();
+        if (!cell.is_null && options.has_nullstr && cell.text == options.nullstr) {
+          cell.is_null = true;
+          cell.text.clear();
+        } else if (!cell.is_null && has_escape && escape == '\\' && cell.text == "\\N") {
+          // MySQL LOAD DATA convention for a NULL written by SELECT INTO OUTFILE.
+          cell.is_null = true;
+          cell.text.clear();
+        }
       }
       if (!cell.is_null) {
         cell.type = infer_cell_type(cell);
       }
       record.cells.push_back(cell);
-      if (i < n && data[i] == ',') {
+      if (i < n && data[i] == delimiter) {
         ++i;
       } else {
         if (i < n && data[i] == '\r') {
@@ -622,11 +700,17 @@ static bool parse_csv_records(const std::string &data, std::vector<CsvRecord> &r
 
 static bool looks_like_identifier(const std::string &t)
 {
-  if (t.empty() || !is_ident_start(t[0])) {
+  // Header names are frequently UTF-8 (for example Chinese column names), so
+  // any non-ASCII byte is accepted as part of a word here even though the SQL
+  // tokenizer only handles ASCII identifiers.
+  const bool start_ok = !t.empty()
+                        && (is_ident_start(t[0]) || static_cast<unsigned char>(t[0]) >= 0x80);
+  if (!start_ok) {
     return false;
   }
   for (size_t i = 1; i < t.size(); ++i) {
-    if (!is_ident_char(t[i])) {
+    const unsigned char c = static_cast<unsigned char>(t[i]);
+    if (!is_ident_char(t[i]) && c < 0x80) {
       return false;
     }
   }
@@ -652,9 +736,21 @@ static bool detect_csv_header(const std::vector<CsvRecord> &records)
 static bool load_csv_table(const std::string &data, const FileSqlOptions &options, FileSqlTable &table)
 {
   std::vector<CsvRecord> records;
-  if (!parse_csv_records(data, records)) {
+  if (!parse_csv_records(data, options, records)) {
     return false;
   }
+  // A completely empty line is not a row; ignore it as CSV readers do instead
+  // of reporting a one-column record against a wider header.
+  std::vector<CsvRecord> non_blank;
+  non_blank.reserve(records.size());
+  for (size_t r = 0; r < records.size(); ++r) {
+    const bool blank = 1 == records[r].cells.size() && !records[r].cells[0].quoted
+                       && records[r].cells[0].is_null && records[r].cells[0].text.empty();
+    if (!blank) {
+      non_blank.push_back(records[r]);
+    }
+  }
+  records.swap(non_blank);
   bool has_header = false;
   if (1 == options.header) {
     has_header = true;
@@ -664,9 +760,14 @@ static bool load_csv_table(const std::string &data, const FileSqlOptions &option
     has_header = detect_csv_header(records);
   }
   size_t column_count = 0;
-  for (size_t r = 0; r < records.size(); ++r) {
-    if (records[r].cells.size() > column_count) {
-      column_count = records[r].cells.size();
+  if (!records.empty()) {
+    column_count = records[0].cells.size();
+    for (size_t r = 0; r < records.size(); ++r) {
+      if (records[r].cells.size() != column_count) {
+        // Ragged rows are a file defect rather than data: surface them
+        // instead of padding a wrong shape into the result.
+        return false;
+      }
     }
   }
   if (column_count == 0) {
@@ -1397,7 +1498,8 @@ static bool parse_parquet_page_header(CompactReader &r,
                                       int &encoding,
                                       int &def_len,
                                       int &rep_len,
-                                      bool &is_compressed)
+                                      bool &is_compressed,
+                                      int &dict_num_values)
 {
   page_type = -1;
   compressed_size = 0;
@@ -1406,6 +1508,7 @@ static bool parse_parquet_page_header(CompactReader &r,
   def_len = 0;
   rep_len = 0;
   is_compressed = true;
+  dict_num_values = 0;
   int16_t last = 0;
   int16_t id = 0;
   uint8_t ft = 0;
@@ -1425,6 +1528,58 @@ static bool parse_parquet_page_header(CompactReader &r,
         page_type = static_cast<int>(v);
       } else {
         compressed_size = static_cast<int>(v);
+      }
+    } else if (5 == id) {
+      // DataPageHeader (v1): NumValues, Encoding, DefinitionLevelEncoding,
+      // RepetitionLevelEncoding, Statistics. The level encodings are always
+      // RLE/bit-packed for the files this reader accepts.
+      int16_t dlast = 0;
+      int16_t did = 0;
+      uint8_t dft = 0;
+      for (;;) {
+        if (!r.field_header(did, dft, dlast)) {
+          return false;
+        }
+        if (dft == 0) {
+          break;
+        }
+        if (1 == did || 2 == did) {
+          int64_t v = 0;
+          if (!r.zigzag(v)) {
+            return false;
+          }
+          if (1 == did) {
+            num_values = static_cast<int>(v);
+          } else {
+            encoding = static_cast<int>(v);
+          }
+        } else if (!r.skip(dft)) {
+          return false;
+        }
+      }
+    } else if (7 == id) {
+      // DictionaryPageHeader: NumValues, Encoding, IsSorted.
+      int16_t dlast = 0;
+      int16_t did = 0;
+      uint8_t dft = 0;
+      for (;;) {
+        if (!r.field_header(did, dft, dlast)) {
+          return false;
+        }
+        if (dft == 0) {
+          break;
+        }
+        if (1 == did || 2 == did) {
+          int64_t v = 0;
+          if (!r.zigzag(v)) {
+            return false;
+          }
+          if (1 == did) {
+            dict_num_values = static_cast<int>(v);
+          }
+        } else if (!r.skip(dft)) {
+          return false;
+        }
       }
     } else if (8 == id) {
       int16_t dlast = 0;
@@ -1554,6 +1709,11 @@ static bool snappy_decompress(const unsigned char *in, const size_t in_len, std:
     if (shift > 35) {
       return false;
     }
+  }
+  if (expected > FILE_SQL_MAX_MATERIALIZED_BYTES) {
+    // A corrupted header could claim an enormous expansion; refuse it here
+    // instead of letting reserve() exhaust memory.
+    return false;
   }
   out.reserve(static_cast<size_t>(expected));
   while (i < in_len) {
@@ -1687,7 +1847,7 @@ static bool decode_plain_cell(const int physical,
       vi += 4;
       float f = 0.0f;
       ::memcpy(&f, &bits, sizeof(f));
-      ::snprintf(buf, sizeof(buf), "%g", static_cast<double>(f));
+      ::snprintf(buf, sizeof(buf), "%.9g", static_cast<double>(f));
       cell.is_null = false;
       cell.text = buf;
       break;
@@ -1725,6 +1885,109 @@ static bool decode_plain_cell(const int physical,
   return true;
 }
 
+// Expand the body of one data page into cells. Dictionary indices use the
+// RLE/bit-packed hybrid layout, so a page of indices is decoded in one pass and
+// then looked up in the dictionary loaded from the preceding dictionary page.
+static bool decode_parquet_page_values(const int physical,
+                                       const int encoding,
+                                       const std::string &values,
+                                       const std::vector<int> &defs,
+                                       const int max_def,
+                                       const std::vector<FileSqlCell> &dict,
+                                       std::vector<FileSqlCell> &cells)
+{
+  bool ok = true;
+  const int count = static_cast<int>(defs.size());
+  const FileSqlType type = parquet_type(physical);
+  cells.clear();
+  cells.reserve(static_cast<size_t>(count));
+  if (0 == encoding) {
+    size_t vi = 0;
+    size_t value_index = 0;
+    for (int k = 0; ok && k < count; ++k) {
+      FileSqlCell cell;
+      if (max_def > 0 && defs[k] != max_def) {
+        cell.is_null = true;
+      } else if (decode_plain_cell(physical, values, vi, value_index, cell)) {
+        cell.type = type;
+        ++value_index;
+      } else {
+        ok = false;
+      }
+      if (ok) {
+        cells.push_back(cell);
+      }
+    }
+  } else if (2 == encoding || 8 == encoding) {
+    int non_null = 0;
+    for (int k = 0; k < count; ++k) {
+      if (max_def <= 0 || defs[k] == max_def) {
+        ++non_null;
+      }
+    }
+    std::vector<int> indices;
+    if (non_null > 0) {
+      if (values.empty()) {
+        ok = false;
+      } else {
+        const int index_width = static_cast<int>(static_cast<unsigned char>(values[0]));
+        ok = decode_levels(reinterpret_cast<const unsigned char *>(values.data()) + 1,
+                           values.size() - 1, non_null, index_width, indices);
+      }
+    }
+    size_t next_index = 0;
+    for (int k = 0; ok && k < count; ++k) {
+      FileSqlCell cell;
+      if (max_def > 0 && defs[k] != max_def) {
+        cell.is_null = true;
+      } else if (next_index >= indices.size() || indices[next_index] < 0
+                 || static_cast<size_t>(indices[next_index]) >= dict.size()) {
+        ok = false;
+      } else {
+        cell = dict[static_cast<size_t>(indices[next_index])];
+        cell.type = type;
+        ++next_index;
+      }
+      if (ok) {
+        cells.push_back(cell);
+      }
+    }
+  } else {
+    // Only PLAIN and dictionary-encoded pages are supported; reject the page
+    // instead of returning values decoded with the wrong layout.
+    ok = false;
+  }
+  return ok;
+}
+
+static bool decode_parquet_dictionary(const unsigned char *data,
+                                      const size_t len,
+                                      const bool compressed,
+                                      const int physical,
+                                      const int count,
+                                      std::vector<FileSqlCell> &dict)
+{
+  bool ok = true;
+  dict.clear();
+  std::string plain;
+  if (compressed && len > 0) {
+    ok = snappy_decompress(data, len, plain);
+  } else if (len > 0) {
+    plain.assign(reinterpret_cast<const char *>(data), len);
+  }
+  size_t vi = 0;
+  for (int k = 0; ok && k < count; ++k) {
+    FileSqlCell cell;
+    if (!decode_plain_cell(physical, plain, vi, static_cast<size_t>(k), cell)) {
+      ok = false;
+    } else {
+      cell.type = parquet_type(physical);
+      dict.push_back(cell);
+    }
+  }
+  return ok;
+}
+
 static bool decode_parquet_column(const std::string &file,
                                   const ParquetColumnChunk &chunk,
                                   const int max_def,
@@ -1733,6 +1996,11 @@ static bool decode_parquet_column(const std::string &file,
   cells.clear();
   if (chunk.num_values <= 0) {
     return true;
+  }
+  if (chunk.codec != 0 && chunk.codec != 1) {
+    // 0: uncompressed, 1: snappy. Other codecs need a decompressor that is not
+    // part of this reader, so the column cannot be decoded correctly.
+    return false;
   }
   size_t pos = static_cast<size_t>(chunk.data_page_offset);
   if (chunk.dictionary_page_offset >= 0 &&
@@ -1746,6 +2014,7 @@ static bool decode_parquet_column(const std::string &file,
   for (int m = max_def; m > 0; m >>= 1) {
     ++bit_width;
   }
+  std::vector<FileSqlCell> dict;
   while (pos < file_size && produced < chunk.num_values) {
     CompactReader r(base + pos, file_size - pos);
     int page_type = -1;
@@ -1755,16 +2024,64 @@ static bool decode_parquet_column(const std::string &file,
     int def_len = 0;
     int rep_len = 0;
     bool is_compressed = true;
+    int dict_num_values = 0;
     if (!parse_parquet_page_header(r, page_type, compressed_size, num_values,
-                                   encoding, def_len, rep_len, is_compressed)) {
+                                   encoding, def_len, rep_len, is_compressed,
+                                   dict_num_values)) {
       return false;
     }
     const size_t header_len = r.i;
-    if (pos + header_len + static_cast<size_t>(compressed_size) > file_size) {
+    if (compressed_size < 0
+        || num_values < 0
+        || static_cast<int64_t>(num_values) > chunk.num_values
+        || pos + header_len + static_cast<size_t>(compressed_size) > file_size) {
       return false;
     }
-    if (3 == page_type && num_values > 0) {
-      const unsigned char *payload = base + pos + header_len;
+    const unsigned char *payload = base + pos + header_len;
+    if (2 == page_type && dict_num_values > 0) {
+      if (!decode_parquet_dictionary(payload, static_cast<size_t>(compressed_size),
+                                     chunk.codec != 0, chunk.type, dict_num_values,
+                                     dict)) {
+        return false;
+      }
+    } else if (0 == page_type && num_values > 0) {
+      // Data page v1: repetition levels (none for flat columns), definition
+      // levels prefixed with their byte length, then the values.
+      std::vector<int> defs;
+      size_t offset = 0;
+      if (max_def > 0) {
+        if (compressed_size < 4) {
+          return false;
+        }
+        const uint32_t def_bytes = read_le32(payload);
+        if (4 + static_cast<size_t>(def_bytes) > static_cast<size_t>(compressed_size)) {
+          return false;
+        }
+        if (!decode_levels(payload + 4, static_cast<size_t>(def_bytes), num_values,
+                           bit_width, defs)) {
+          return false;
+        }
+        offset = 4 + static_cast<size_t>(def_bytes);
+      } else {
+        defs.assign(num_values, 0);
+      }
+      const size_t values_len = static_cast<size_t>(compressed_size) - offset;
+      std::string values;
+      if (chunk.codec != 0 && values_len > 0) {
+        if (!snappy_decompress(payload + offset, values_len, values)) {
+          return false;
+        }
+      } else {
+        values.assign(reinterpret_cast<const char *>(payload + offset), values_len);
+      }
+      std::vector<FileSqlCell> page_cells;
+      if (!decode_parquet_page_values(chunk.type, encoding, values, defs, max_def,
+                                      dict, page_cells)) {
+        return false;
+      }
+      cells.insert(cells.end(), page_cells.begin(), page_cells.end());
+      produced += num_values;
+    } else if (3 == page_type && num_values > 0) {
       if (rep_len < 0 || def_len < 0 || rep_len + def_len > compressed_size) {
         return false;
       }
@@ -1779,7 +2096,7 @@ static bool decode_parquet_column(const std::string &file,
       }
       const int values_len = compressed_size - rep_len - def_len;
       std::string values;
-      if (is_compressed && values_len > 0) {
+      if (is_compressed && chunk.codec != 0 && values_len > 0) {
         if (!snappy_decompress(payload + rep_len + def_len,
                                static_cast<size_t>(values_len), values)) {
           return false;
@@ -1788,31 +2105,17 @@ static bool decode_parquet_column(const std::string &file,
         values.assign(reinterpret_cast<const char *>(payload + rep_len + def_len),
                       static_cast<size_t>(values_len));
       }
-      size_t vi = 0;
-      size_t value_index = 0;
-      for (int k = 0; k < num_values; ++k) {
-        FileSqlCell cell;
-        if (max_def > 0 && defs[k] != max_def) {
-          cell.is_null = true;
-          cell.type = FILE_SQL_NULL;
-        } else {
-          if (!decode_plain_cell(chunk.type, values, vi, value_index, cell)) {
-            return false;
-          }
-          if (max_def > 0) {
-            cell.type = parquet_type(chunk.type);
-          } else {
-            cell.type = parquet_type(chunk.type);
-          }
-        }
-        ++value_index;
-        cells.push_back(cell);
-        ++produced;
+      std::vector<FileSqlCell> page_cells;
+      if (!decode_parquet_page_values(chunk.type, encoding, values, defs, max_def,
+                                      dict, page_cells)) {
+        return false;
       }
+      cells.insert(cells.end(), page_cells.begin(), page_cells.end());
+      produced += num_values;
     }
     pos += header_len + static_cast<size_t>(compressed_size);
   }
-  return true;
+  return produced >= chunk.num_values;
 }
 
 static bool load_parquet_table(const std::string &path, FileSqlTable &table)
@@ -1833,7 +2136,10 @@ static bool load_parquet_table(const std::string &path, FileSqlTable &table)
   const size_t footer_start = file.size() - 8 - static_cast<size_t>(footer_len);
   CompactReader r(base + footer_start, footer_len);
   std::vector<ParquetSchemaElement> schema;
-  std::vector<ParquetColumnChunk> chunks;
+  // A file may contain several row groups; each group stores one chunk per
+  // leaf column. Keep the groups apart so the rows are concatenated in file
+  // order instead of silently reading only the first group.
+  std::vector<std::vector<ParquetColumnChunk> > row_groups;
   int16_t last = 0;
   int16_t id = 0;
   uint8_t ft = 0;
@@ -1864,6 +2170,7 @@ static bool load_parquet_table(const std::string &path, FileSqlTable &table)
         return false;
       }
       for (int32_t k = 0; k < sz; ++k) {
+        std::vector<ParquetColumnChunk> group;
         int16_t rlast = 0;
         int16_t rid = 0;
         uint8_t rft = 0;
@@ -1885,12 +2192,13 @@ static bool load_parquet_table(const std::string &path, FileSqlTable &table)
               if (!parse_parquet_column_chunk(r, chunk)) {
                 return false;
               }
-              chunks.push_back(chunk);
+              group.push_back(chunk);
             }
           } else if (!r.skip(rft)) {
             return false;
           }
         }
+        row_groups.push_back(group);
       }
     } else if (!r.skip(ft)) {
       return false;
@@ -1903,6 +2211,11 @@ static bool load_parquet_table(const std::string &path, FileSqlTable &table)
     }
   }
   for (size_t c = 0; c < leaves.size(); ++c) {
+    if (2 == schema[leaves[c]].repetition) {
+      // Repeated primitive columns need repetition-level handling that this
+      // flat reader does not provide.
+      return false;
+    }
     FileSqlColumn column;
     column.name = schema[leaves[c]].name;
     column.type = parquet_type(schema[leaves[c]].type);
@@ -1915,13 +2228,16 @@ static bool load_parquet_table(const std::string &path, FileSqlTable &table)
   std::vector<std::vector<FileSqlCell> > columns_data;
   columns_data.resize(leaves.size());
   for (size_t c = 0; c < leaves.size(); ++c) {
-    if (chunks.empty()) {
-      return false;
-    }
-    const size_t chunk_index = (chunks.size() == leaves.size()) ? c : 0;
     const int max_def = schema[leaves[c]].repetition == 1 ? 1 : 0;
-    if (!decode_parquet_column(file, chunks[chunk_index], max_def, columns_data[c])) {
-      return false;
+    for (size_t g = 0; g < row_groups.size(); ++g) {
+      if (row_groups[g].size() != leaves.size()) {
+        return false;
+      }
+      std::vector<FileSqlCell> group_cells;
+      if (!decode_parquet_column(file, row_groups[g][c], max_def, group_cells)) {
+        return false;
+      }
+      columns_data[c].insert(columns_data[c].end(), group_cells.begin(), group_cells.end());
     }
   }
   size_t row_count = 0;
@@ -1994,6 +2310,17 @@ static std::string strip_trailing_slash(const std::string &s)
   return out;
 }
 
+static bool path_within(const char *path, const char *root)
+{
+  const std::string p(path);
+  const std::string r(root);
+  bool within = p.size() >= r.size() && p.compare(0, r.size(), r) == 0;
+  if (within && p.size() > r.size() && '/' != r[r.size() - 1] && '/' != p[r.size()]) {
+    within = false;
+  }
+  return within;
+}
+
 static bool path_allowed(const ObSQLSessionInfo &session, const std::string &path)
 {
   common::ObString priv;
@@ -2001,28 +2328,32 @@ static bool path_allowed(const ObSQLSessionInfo &session, const std::string &pat
   if (OB_SUCCESS == session.get_secure_file_priv(priv) && !priv.empty()) {
     const std::string p = trim(std::string(priv.ptr(), static_cast<size_t>(priv.length())));
     if (!p.empty() && p != "/") {
-      std::string dir = path;
-      const size_t wildcard = dir.find_first_of("*?[");
-      if (std::string::npos != wildcard) {
-        dir = dir.substr(0, wildcard);
-      }
-      const size_t slash = dir.find_last_of('/');
-      dir = (std::string::npos == slash) ? "." : dir.substr(0, slash + 1);
+      const size_t wildcard = path.find_first_of("*?[");
+      const bool exact = std::string::npos == wildcard;
       char resolved[PATH_MAX];
       char resolved_priv[PATH_MAX];
-      const std::string dir_trim = strip_trailing_slash(dir);
       const std::string priv_trim = strip_trailing_slash(p);
-      if (NULL == ::realpath(dir_trim.c_str(), resolved) ||
-          NULL == ::realpath(priv_trim.c_str(), resolved_priv)) {
+      if (NULL == ::realpath(priv_trim.c_str(), resolved_priv)) {
         allowed = false;
+      } else if (exact && NULL != ::realpath(path.c_str(), resolved)) {
+        // Resolve the file itself, not just its directory, so a symbolic link
+        // inside the allowed directory cannot read a file outside of it.
+        allowed = path_within(resolved, resolved_priv);
       } else {
-        const std::string r(resolved);
-        const std::string rp(resolved_priv);
-        bool prefix = r.size() >= rp.size() && r.compare(0, rp.size(), rp) == 0;
-        if (prefix && r.size() > rp.size() && rp != "/" && r[rp.size()] != '/') {
-          prefix = false;
+        // Glob patterns and COPY targets that do not exist yet are checked
+        // through their parent directory.
+        std::string dir = path;
+        if (!exact) {
+          dir = dir.substr(0, wildcard);
         }
-        allowed = prefix;
+        const size_t slash = dir.find_last_of('/');
+        dir = (std::string::npos == slash) ? "." : dir.substr(0, slash + 1);
+        const std::string dir_trim = strip_trailing_slash(dir);
+        if (NULL == ::realpath(dir_trim.c_str(), resolved)) {
+          allowed = false;
+        } else {
+          allowed = path_within(resolved, resolved_priv);
+        }
       }
     }
   }
@@ -2044,12 +2375,13 @@ struct FileSqlCall
 static bool is_file_function_name(const std::string &name, FileSqlKind &kind)
 {
   bool found = true;
-  if (equal_ci(name, "read_csv")) {
+  if (equal_ci(name, "read_csv") || equal_ci(name, "read_csv_auto")) {
     kind = FILE_SQL_CSV;
-  } else if (equal_ci(name, "read_json") || equal_ci(name, "read_ndjson") ||
-             equal_ci(name, "read_jsonl")) {
+  } else if (equal_ci(name, "read_json") || equal_ci(name, "read_json_auto")
+             || equal_ci(name, "read_ndjson") || equal_ci(name, "read_ndjson_auto")
+             || equal_ci(name, "read_jsonl")) {
     kind = FILE_SQL_JSON;
-  } else if (equal_ci(name, "read_parquet")) {
+  } else if (equal_ci(name, "read_parquet") || equal_ci(name, "read_parquet_auto")) {
     kind = FILE_SQL_PARQUET;
   } else if (equal_ci(name, "glob")) {
     kind = FILE_SQL_GLOB;
@@ -2118,7 +2450,9 @@ static int parse_file_arguments(const std::string &func_name,
         ret = OB_NOT_SUPPORTED;
       } else {
         const long long n = ::strtoll(val.c_str(), NULL, 10);
-        if (n > 0 || n < -1) {
+        // Only -1 (scan the whole file) is supported; any other value would
+        // change how types are inferred and is rejected rather than ignored.
+        if (-1 != n) {
           ret = OB_NOT_SUPPORTED;
         }
       }
@@ -2136,6 +2470,40 @@ static int parse_file_arguments(const std::string &func_name,
       std::string f;
       if (!parse_string_literal(val, f) || !equal_ci(f, "csv")) {
         ret = OB_NOT_SUPPORTED;
+      }
+    } else if ((equal_ci(opt, "delimiter") || equal_ci(opt, "delim") || equal_ci(opt, "sep"))
+               && FILE_SQL_CSV == kind) {
+      std::string f;
+      if (!parse_string_literal(val, f) || f.size() != 1) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        call.options.has_delimiter = true;
+        call.options.delimiter = f;
+      }
+    } else if (equal_ci(opt, "quote") && FILE_SQL_CSV == kind) {
+      std::string f;
+      if (!parse_string_literal(val, f) || f.size() > 1) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        call.options.has_quote = true;
+        call.options.quote = f;
+      }
+    } else if (equal_ci(opt, "escape") && FILE_SQL_CSV == kind) {
+      std::string f;
+      if (!parse_string_literal(val, f) || f.size() > 1) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        call.options.has_escape = true;
+        call.options.escape = f;
+      }
+    } else if ((equal_ci(opt, "nullstr") || equal_ci(opt, "null_string") || equal_ci(opt, "null"))
+               && FILE_SQL_CSV == kind) {
+      std::string f;
+      if (!parse_string_literal(val, f)) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        call.options.has_nullstr = true;
+        call.options.nullstr = f;
       }
     } else {
       ret = OB_NOT_SUPPORTED;
@@ -2164,8 +2532,19 @@ static int load_file_table(const std::string &path, const FileSqlCall &call, Fil
     if (!read_whole_file(path, data)) {
       ret = OB_ERR_PARSE_SQL;
     } else if (FILE_SQL_CSV == call.kind) {
+      // A UTF-8 BOM is an encoding marker, not part of the first header name.
+      if (data.size() >= 3 && 0xEF == static_cast<unsigned char>(data[0])
+          && 0xBB == static_cast<unsigned char>(data[1])
+          && 0xBF == static_cast<unsigned char>(data[2])) {
+        data.erase(0, 3);
+      }
       ok = load_csv_table(data, call.options, table);
     } else if (FILE_SQL_JSON == call.kind) {
+      if (data.size() >= 3 && 0xEF == static_cast<unsigned char>(data[0])
+          && 0xBB == static_cast<unsigned char>(data[1])
+          && 0xBF == static_cast<unsigned char>(data[2])) {
+        data.erase(0, 3);
+      }
       ok = load_json_table(data, table);
     }
     if (OB_SUCCESS == ret && !ok) {
@@ -2228,8 +2607,12 @@ static std::string cell_sql(const FileSqlCell &cell, const FileSqlType column_ty
   return out;
 }
 
-static void materialize_table(const FileSqlTable &table, std::string &out)
+// A file is expanded into one SELECT branch per row, so its rewritten text
+// grows with the row count. Bound that text: a scan this large would exhaust
+// memory in the parser anyway, and a clear error is better than an OOM.
+static bool materialize_table(const FileSqlTable &table, std::string &out)
 {
+  bool ok = true;
   out.clear();
   out += "(";
   if (table.columns.empty() || table.rows.empty()) {
@@ -2247,22 +2630,28 @@ static void materialize_table(const FileSqlTable &table, std::string &out)
     }
     out += " from dual where 1 = 0)";
   } else {
-    for (size_t r = 0; r < table.rows.size(); ++r) {
+    for (size_t r = 0; ok && r < table.rows.size(); ++r) {
       if (r > 0) {
         out += " union all ";
       }
       out += "select ";
-      for (size_t c = 0; c < table.columns.size(); ++c) {
+      for (size_t c = 0; ok && c < table.columns.size(); ++c) {
         if (c > 0) {
           out += ", ";
         }
         out += cell_sql(table.rows[r][c], table.columns[c].type);
-        out += " as ";
-        out += quote_ident(table.columns[c].name);
+        // Only the first branch of the union names the columns; repeating the
+        // aliases for every row would needlessly inflate the rewritten text.
+        if (0 == r) {
+          out += " as ";
+          out += quote_ident(table.columns[c].name);
+        }
       }
+      ok = out.size() <= FILE_SQL_MAX_MATERIALIZED_BYTES;
     }
     out += ")";
   }
+  return ok;
 }
 
 static bool is_clause_keyword(const std::string &word)
@@ -2367,7 +2756,10 @@ static int rewrite_file_functions(const ObSQLSessionInfo &session,
       break;
     }
     std::string materialized;
-    materialize_table(table, materialized);
+    if (!materialize_table(table, materialized)) {
+      ret = OB_SIZE_OVERFLOW;
+      break;
+    }
     output.append(input, copied, name_start - copied);
     output += materialized;
     if (!has_table_alias(input, close + 1)) {
@@ -2458,8 +2850,16 @@ static int rewrite_describe(const ObSQLSessionInfo &session,
 
 struct CopyOptions
 {
-  CopyOptions() : header(false) {}
+  CopyOptions()
+      : header(false),
+        delimiter(","),
+        quote("\""),
+        escape("\\"),
+        nullstr("") {}
   bool header;
+  std::string delimiter;
+  std::string quote;
+  std::string escape;
   std::string nullstr;
 };
 
@@ -2536,6 +2936,48 @@ static bool find_top_level_word(const std::string &s,
   return false;
 }
 
+static bool read_option_string(const std::string &part, size_t &p, std::string &value)
+{
+  skip_space_comments(part, p);
+  if (p < part.size() && '=' == part[p]) {
+    ++p;
+  }
+  if (!read_string_token(part, p, value)) {
+    return false;
+  }
+  skip_space_comments(part, p);
+  return p == part.size();
+}
+
+static bool parse_header_option(const std::string &part, size_t &p, bool &value)
+{
+  skip_space_comments(part, p);
+  if (p >= part.size()) {
+    value = true;
+    return true;
+  }
+  if ('=' == part[p]) {
+    ++p;
+    skip_space_comments(part, p);
+  }
+  std::string word;
+  if (!read_identifier_token(part, p, word)) {
+    return false;
+  }
+  skip_space_comments(part, p);
+  if (p != part.size()) {
+    return false;
+  }
+  if (equal_ci(word, "true") || "1" == word) {
+    value = true;
+  } else if (equal_ci(word, "false") || "0" == word) {
+    value = false;
+  } else {
+    return false;
+  }
+  return true;
+}
+
 static int parse_copy_options(const std::string &text, CopyOptions &opts)
 {
   int ret = OB_SUCCESS;
@@ -2553,17 +2995,41 @@ static int parse_copy_options(const std::string &text, CopyOptions &opts)
     if (!read_identifier_token(part, p, name)) {
       ret = OB_ERR_PARSE_SQL;
     } else if (equal_ci(name, "header")) {
-      opts.header = true;
-      if (p != part.size()) {
+      if (!parse_header_option(part, p, opts.header)) {
         ret = OB_ERR_PARSE_SQL;
       }
     } else if (equal_ci(name, "format")) {
       std::string v;
-      if (!read_identifier_token(part, p, v) || !equal_ci(v, "csv")) {
+      bool ok = read_identifier_token(part, p, v) || read_string_token(part, p, v);
+      if (!ok || !equal_ci(v, "csv")) {
         ret = OB_NOT_SUPPORTED;
       }
-    } else if (equal_ci(name, "nullstr")) {
-      if (!read_string_token(part, p, opts.nullstr)) {
+    } else if (equal_ci(name, "delimiter") || equal_ci(name, "field_delimiter")
+               || equal_ci(name, "sep")) {
+      std::string v;
+      if (!read_option_string(part, p, v) || v.size() != 1) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        opts.delimiter = v;
+      }
+    } else if (equal_ci(name, "quote") || equal_ci(name, "quote_char")
+               || equal_ci(name, "field_optionally_enclosed_by")) {
+      std::string v;
+      if (!read_option_string(part, p, v) || v.size() > 1) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        opts.quote = v;
+      }
+    } else if (equal_ci(name, "escape") || equal_ci(name, "escape_char")) {
+      std::string v;
+      if (!read_option_string(part, p, v) || v.size() > 1) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        opts.escape = v;
+      }
+    } else if (equal_ci(name, "nullstr") || equal_ci(name, "null_string")
+               || equal_ci(name, "null")) {
+      if (!read_option_string(part, p, opts.nullstr)) {
         ret = OB_NOT_SUPPORTED;
       }
     } else {
@@ -2711,11 +3177,26 @@ static int compare_cells(const FileSqlCell &a, const FileSqlCell &b)
   return result;
 }
 
-static std::string csv_field(const std::string &v)
+static bool path_exists(const std::string &path)
 {
-  bool need_quote = v.empty();
+  struct stat st;
+  return 0 == ::stat(path.c_str(), &st);
+}
+
+static std::string csv_field(const std::string &v, const CopyOptions &opts, const bool force_quote)
+{
+  const char delimiter = opts.delimiter.empty() ? ',' : opts.delimiter[0];
+  // A quote character is always available: without one, a value containing the
+  // delimiter or a newline could not be written so that read_csv returns it.
+  const char quote = opts.quote.empty() ? '"' : opts.quote[0];
+  const bool has_escape = !opts.escape.empty();
+  const char escape = has_escape ? opts.escape[0] : '\\';
+  bool need_quote = v.empty() || force_quote;
   for (size_t i = 0; !need_quote && i < v.size(); ++i) {
-    if (',' == v[i] || '"' == v[i] || '\n' == v[i] || '\r' == v[i]) {
+    const char c = v[i];
+    if (c == delimiter || c == '\n' || c == '\r') {
+      need_quote = true;
+    } else if (c == quote || (has_escape && c == escape)) {
       need_quote = true;
     }
   }
@@ -2723,15 +3204,22 @@ static std::string csv_field(const std::string &v)
     return v;
   }
   std::string out;
-  out.push_back('"');
+  out.push_back(quote);
   for (size_t i = 0; i < v.size(); ++i) {
-    if ('"' == v[i]) {
-      out += "\"\"";
+    const char c = v[i];
+    if (has_escape && (c == escape || c == quote)) {
+      out.push_back(escape);
+      out.push_back(c);
+    } else if (!has_escape && (c == quote || c == escape)) {
+      // Without a user escape character, double the quote and the reader's
+      // default escape character so both survive a read-back.
+      out.push_back(c);
+      out.push_back(c);
     } else {
-      out.push_back(v[i]);
+      out.push_back(c);
     }
   }
-  out.push_back('"');
+  out.push_back(quote);
   return out;
 }
 
@@ -2742,14 +3230,18 @@ static bool write_copy_file(const std::string &path,
                             const CopyOptions &opts)
 {
   bool ok = true;
-  FILE *fp = ::fopen(path.c_str(), "wb");
+  const char delimiter = opts.delimiter.empty() ? ',' : opts.delimiter[0];
+  // Write next to the target and rename, so a failed export never leaves a
+  // half-written file under the requested name.
+  const std::string tmp_path = path + ".file_sql_tmp";
+  FILE *fp = ::fopen(tmp_path.c_str(), "wb");
   if (NULL == fp) {
     return false;
   }
   if (opts.header) {
-    for (size_t c = 0; c < projection.size(); ++c) {
-      const std::string field = csv_field(table.columns[projection[c]].name);
-      if (c > 0 && ::fputc(',', fp) == EOF) {
+    for (size_t c = 0; ok && c < projection.size(); ++c) {
+      const std::string field = csv_field(table.columns[projection[c]].name, opts, false);
+      if (c > 0 && ::fputc(delimiter, fp) == EOF) {
         ok = false;
       }
       if (ok && ::fwrite(field.data(), 1, field.size(), fp) != field.size()) {
@@ -2768,9 +3260,13 @@ static bool write_copy_file(const std::string &path,
       if (cell.is_null) {
         field = opts.nullstr;
       } else {
-        field = csv_field(cell.text);
+        // A text value that happens to spell the NULL marker must stay quoted,
+        // otherwise reading the file back would turn it into a NULL.
+        const bool force_quote = opts.nullstr.empty() ? (cell.text == "\\N")
+                                                      : (cell.text == opts.nullstr);
+        field = csv_field(cell.text, opts, force_quote);
       }
-      if (c > 0 && ::fputc(',', fp) == EOF) {
+      if (c > 0 && ::fputc(delimiter, fp) == EOF) {
         ok = false;
       }
       if (ok && ::fwrite(field.data(), 1, field.size(), fp) != field.size()) {
@@ -2783,6 +3279,12 @@ static bool write_copy_file(const std::string &path,
   }
   if (0 != ::fclose(fp)) {
     ok = false;
+  }
+  if (ok && 0 != ::rename(tmp_path.c_str(), path.c_str())) {
+    ok = false;
+  }
+  if (!ok) {
+    ::remove(tmp_path.c_str());
   }
   return ok;
 }
@@ -2895,7 +3397,109 @@ static int evaluate_copy_source(const ObSQLSessionInfo &session,
     return x < y;
   });
   if (!write_copy_file(out_path, table, projection, order, opts)) {
+    ret = OB_IO_ERROR;
+  }
+  return ret;
+}
+
+static bool contains_file_function(const std::string &sql);
+
+static bool is_table_reference(const std::string &text)
+{
+  bool ok = !text.empty();
+  for (size_t i = 0; ok && i < text.size(); ++i) {
+    const char c = text[i];
+    if (!is_ident_char(c) && '.' != c && '`' != c && ' ' != c && '\t' != c
+        && '\n' != c && '\r' != c) {
+      ok = false;
+    }
+  }
+  return ok;
+}
+
+static void append_copy_format(std::string &sql, const CopyOptions &opts)
+{
+  sql += " format = (type = 'CSV', field_delimiter = ";
+  sql += quote_sql_string(opts.delimiter.empty() ? std::string(",") : opts.delimiter);
+  // Always enclose fields that need it. Without an enclosing character the
+  // writer cannot represent a string containing the delimiter or a newline,
+  // and the file would no longer read back with read_csv.
+  sql += ", field_optionally_enclosed_by = ";
+  sql += quote_sql_string(opts.quote.empty() ? std::string("\"") : opts.quote);
+  if (!opts.escape.empty()) {
+    sql += ", escape = ";
+    sql += quote_sql_string(opts.escape);
+  }
+  if (opts.header) {
+    sql += ", parse_header = true";
+  }
+  // Always pin the NULL text, including the empty string, so a NULL column is
+  // distinct from an empty string when the file is read back.
+  sql += ", null_if = (";
+  sql += quote_sql_string(opts.nullstr);
+  sql += "))";
+}
+
+// Build the engine statement for COPY sources that are not a single file
+// function table. Executing through SELECT ... INTO OUTFILE keeps the export
+// inside the session (same database, transaction and privilege context), lets
+// the engine stream the rows, and reuses the CSV writer options.
+static int build_copy_outfile(const ObSQLSessionInfo &session,
+                              const std::string &inner,
+                              const std::string &path,
+                              const CopyOptions &opts,
+                              std::string &output)
+{
+  int ret = OB_SUCCESS;
+  std::string select_sql = trim(inner);
+  if (select_sql.empty()) {
     ret = OB_ERR_PARSE_SQL;
+  } else {
+    size_t first = 0;
+    std::string word;
+    bool is_query = false;
+    if (!read_identifier_token(select_sql, first, word)) {
+      // Not an identifier: fall through to the table-reference check below.
+    } else if (equal_ci(word, "select") || equal_ci(word, "values")) {
+      is_query = true;
+    } else if (equal_ci(word, "table")) {
+      // DuckDB's TABLE t shorthand: only valid as a query in its own dialect,
+      // so answer it with the equivalent SELECT.
+      select_sql = "select * from " + trim(select_sql.substr(first));
+      is_query = true;
+    } else if (equal_ci(word, "with")) {
+      // The select_into production does not accept a WITH clause before its
+      // INTO clause, so nest the query instead of appending it directly.
+      select_sql = "select * from (" + select_sql + ") __ob_file_sql_copy";
+      is_query = true;
+    }
+    if (!is_query && !select_sql.empty() && '(' == select_sql[0]) {
+      // A parenthesised query expression is not accepted where a table name is
+      // expected, so make it the derived table of a plain SELECT.
+      select_sql = "select * from (" + select_sql + ") __ob_file_sql_copy";
+      is_query = true;
+    }
+    if (is_query) {
+      // keep the query text as written
+    } else if (!is_table_reference(select_sql)) {
+      ret = OB_ERR_PARSE_SQL;
+    } else {
+      select_sql = "select * from " + select_sql;
+    }
+  }
+  if (OB_SUCC(ret) && contains_file_function(select_sql)) {
+    std::string rewritten_select;
+    bool found = false;
+    ret = rewrite_file_functions(session, select_sql, rewritten_select, NULL, found);
+    if (OB_SUCC(ret) && found) {
+      select_sql = rewritten_select;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    output = select_sql;
+    output += " into outfile ";
+    output += quote_sql_string(path);
+    append_copy_format(output, opts);
   }
   return ret;
 }
@@ -2944,16 +3548,30 @@ static int rewrite_copy(const ObSQLSessionInfo &session,
     ret = parse_copy_options(sql.substr(p + 1, opt_close - p - 1), opts);
     p = opt_close + 1;
   }
-  if (OB_SUCCESS == ret) {
-    ret = evaluate_copy_source(session, inner, path, opts);
+  if (OB_SUCC(ret) && path_exists(path)) {
+    // SELECT INTO OUTFILE refuses to clobber an existing file; COPY keeps the
+    // same contract instead of silently replacing someone else's data.
+    ret = OB_FILE_ALREADY_EXIST;
   }
-  if (OB_SUCCESS == ret) {
-    // The file is already written above, so the statement sent on to the
-    // executor only has to succeed. It must not return a result set: clients
-    // print the column header even when a result set has no rows, and COPY is
-    // expected to answer with a plain OK packet.
-    output = "set @ob_file_sql_copy_done = 1";
-    rewritten = true;
+  if (OB_SUCC(ret)) {
+    // A plain scan of one file function is answered in place: the file is read
+    // once here and never has to travel through the SQL layer. Any other
+    // source (real tables, joins, aggregates) is handed to the engine as
+    // SELECT ... INTO OUTFILE so it streams instead of being materialized.
+    const int local_ret = evaluate_copy_source(session, inner, path, opts);
+    if (OB_SUCCESS == local_ret) {
+      // The file is already written above, so the statement sent on to the
+      // executor only has to succeed. It must not return a result set: clients
+      // print the column header even when a result set has no rows, and COPY is
+      // expected to answer with a plain OK packet.
+      output = "set @ob_file_sql_copy_done = 1";
+      rewritten = true;
+    } else if (OB_NOT_SUPPORTED == local_ret) {
+      ret = build_copy_outfile(session, inner, path, opts, output);
+      rewritten = (OB_SUCCESS == ret);
+    } else {
+      ret = local_ret;
+    }
   }
   return ret;
 }
@@ -3024,6 +3642,10 @@ static void log_file_sql_error(const int code)
 {
   if (OB_NOT_SUPPORTED == code) {
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table function");
+  } else if (OB_FILE_ALREADY_EXIST == code) {
+    LOG_USER_ERROR(OB_FILE_ALREADY_EXIST);
+  } else if (OB_IO_ERROR == code) {
+    LOG_USER_ERROR(OB_IO_ERROR);
   } else {
     const char *msg = "invalid file table function";
     LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
