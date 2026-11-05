@@ -1954,6 +1954,9 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(ObFileSqlRewriter::rewrite(allocator, session, trimed_stmt,
                                                 rewritten_stmt, file_sql_rewritten))) {
+    // A statement the rewriter rejects is answered like any other statement
+    // error: the client keeps its connection and can send the next statement.
+    result.get_exec_context().set_need_disconnect(false);
   } else if (file_sql_rewritten) {
     trimed_stmt = rewritten_stmt;
   }
@@ -1966,6 +1969,7 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(ai_column::ObAIColumnRewriter::rewrite(allocator, session, trimed_stmt,
                                                             ai_column_stmt, ai_column_rewritten))) {
+    result.get_exec_context().set_need_disconnect(false);
   } else if (ai_column_rewritten) {
     trimed_stmt = ai_column_stmt;
   }
