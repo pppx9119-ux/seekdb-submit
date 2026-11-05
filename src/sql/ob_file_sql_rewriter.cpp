@@ -86,10 +86,24 @@ struct FileSqlTable
 
 struct FileSqlOptions
 {
-  FileSqlOptions() : header(0), has_format(false) {}
+  FileSqlOptions()
+      : header(0),
+        has_format(false),
+        has_delimiter(false),
+        has_quote(false),
+        has_escape(false),
+        has_nullstr(false) {}
   int header; // 0: auto, 1: header present, 2: no header
   bool has_format;
   std::string format;
+  bool has_delimiter;
+  std::string delimiter;
+  bool has_quote;
+  std::string quote;
+  bool has_escape;
+  std::string escape;
+  bool has_nullstr;
+  std::string nullstr;
 };
 
 static bool is_ident_start(const char c)
@@ -548,30 +562,40 @@ struct CsvRecord
   std::vector<FileSqlCell> cells;
 };
 
-static bool parse_csv_records(const std::string &data, std::vector<CsvRecord> &records)
+static bool parse_csv_records(const std::string &data,
+                              const FileSqlOptions &options,
+                              std::vector<CsvRecord> &records)
 {
   records.clear();
   const size_t n = data.size();
+  const char delimiter = (options.has_delimiter && !options.delimiter.empty())
+                             ? options.delimiter[0] : ',';
+  const char quote = (options.has_quote && !options.quote.empty())
+                         ? options.quote[0] : '"';
+  const char escape = (options.has_escape && !options.escape.empty())
+                          ? options.escape[0] : '\\';
+  const bool has_quote = !(options.has_quote && options.quote.empty());
+  const bool has_escape = !(options.has_escape && options.escape.empty());
   size_t i = 0;
   while (i < n) {
     CsvRecord record;
     bool line_done = false;
     while (!line_done) {
       FileSqlCell cell;
-      if (i < n && data[i] == '"') {
+      if (i < n && has_quote && data[i] == quote) {
         cell.is_null = false;
         cell.quoted = true;
         ++i;
         while (i < n) {
-          if (data[i] == '"') {
-            if (i + 1 < n && data[i + 1] == '"') {
-              cell.text.push_back('"');
+          if (data[i] == quote) {
+            if (i + 1 < n && data[i + 1] == quote) {
+              cell.text.push_back(quote);
               i += 2;
             } else {
               ++i;
               break;
             }
-          } else if (data[i] == '\\' && i + 1 < n) {
+          } else if (has_escape && data[i] == escape && i + 1 < n) {
             const char e = data[i + 1];
             i += 2;
             switch (e) {
@@ -591,17 +615,25 @@ static bool parse_csv_records(const std::string &data, std::vector<CsvRecord> &r
         }
       } else {
         const size_t start = i;
-        while (i < n && data[i] != ',' && data[i] != '\n' && data[i] != '\r') {
+        while (i < n && data[i] != delimiter && data[i] != '\n' && data[i] != '\r') {
           ++i;
         }
         cell.text.assign(data, start, i - start);
         cell.is_null = cell.text.empty();
+        if (!cell.is_null && options.has_nullstr && cell.text == options.nullstr) {
+          cell.is_null = true;
+          cell.text.clear();
+        } else if (!cell.is_null && has_escape && escape == '\\' && cell.text == "\\N") {
+          // MySQL LOAD DATA convention for a NULL written by SELECT INTO OUTFILE.
+          cell.is_null = true;
+          cell.text.clear();
+        }
       }
       if (!cell.is_null) {
         cell.type = infer_cell_type(cell);
       }
       record.cells.push_back(cell);
-      if (i < n && data[i] == ',') {
+      if (i < n && data[i] == delimiter) {
         ++i;
       } else {
         if (i < n && data[i] == '\r') {
@@ -652,7 +684,7 @@ static bool detect_csv_header(const std::vector<CsvRecord> &records)
 static bool load_csv_table(const std::string &data, const FileSqlOptions &options, FileSqlTable &table)
 {
   std::vector<CsvRecord> records;
-  if (!parse_csv_records(data, records)) {
+  if (!parse_csv_records(data, options, records)) {
     return false;
   }
   bool has_header = false;
@@ -2137,6 +2169,40 @@ static int parse_file_arguments(const std::string &func_name,
       if (!parse_string_literal(val, f) || !equal_ci(f, "csv")) {
         ret = OB_NOT_SUPPORTED;
       }
+    } else if ((equal_ci(opt, "delimiter") || equal_ci(opt, "delim") || equal_ci(opt, "sep"))
+               && FILE_SQL_CSV == kind) {
+      std::string f;
+      if (!parse_string_literal(val, f) || f.size() != 1) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        call.options.has_delimiter = true;
+        call.options.delimiter = f;
+      }
+    } else if (equal_ci(opt, "quote") && FILE_SQL_CSV == kind) {
+      std::string f;
+      if (!parse_string_literal(val, f) || f.size() > 1) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        call.options.has_quote = true;
+        call.options.quote = f;
+      }
+    } else if (equal_ci(opt, "escape") && FILE_SQL_CSV == kind) {
+      std::string f;
+      if (!parse_string_literal(val, f) || f.size() > 1) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        call.options.has_escape = true;
+        call.options.escape = f;
+      }
+    } else if ((equal_ci(opt, "nullstr") || equal_ci(opt, "null_string") || equal_ci(opt, "null"))
+               && FILE_SQL_CSV == kind) {
+      std::string f;
+      if (!parse_string_literal(val, f)) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        call.options.has_nullstr = true;
+        call.options.nullstr = f;
+      }
     } else {
       ret = OB_NOT_SUPPORTED;
     }
@@ -2458,8 +2524,16 @@ static int rewrite_describe(const ObSQLSessionInfo &session,
 
 struct CopyOptions
 {
-  CopyOptions() : header(false) {}
+  CopyOptions()
+      : header(false),
+        delimiter(","),
+        quote("\""),
+        escape("\\"),
+        nullstr("") {}
   bool header;
+  std::string delimiter;
+  std::string quote;
+  std::string escape;
   std::string nullstr;
 };
 
@@ -2536,6 +2610,48 @@ static bool find_top_level_word(const std::string &s,
   return false;
 }
 
+static bool read_option_string(const std::string &part, size_t &p, std::string &value)
+{
+  skip_space_comments(part, p);
+  if (p < part.size() && '=' == part[p]) {
+    ++p;
+  }
+  if (!read_string_token(part, p, value)) {
+    return false;
+  }
+  skip_space_comments(part, p);
+  return p == part.size();
+}
+
+static bool parse_header_option(const std::string &part, size_t &p, bool &value)
+{
+  skip_space_comments(part, p);
+  if (p >= part.size()) {
+    value = true;
+    return true;
+  }
+  if ('=' == part[p]) {
+    ++p;
+    skip_space_comments(part, p);
+  }
+  std::string word;
+  if (!read_identifier_token(part, p, word)) {
+    return false;
+  }
+  skip_space_comments(part, p);
+  if (p != part.size()) {
+    return false;
+  }
+  if (equal_ci(word, "true") || "1" == word) {
+    value = true;
+  } else if (equal_ci(word, "false") || "0" == word) {
+    value = false;
+  } else {
+    return false;
+  }
+  return true;
+}
+
 static int parse_copy_options(const std::string &text, CopyOptions &opts)
 {
   int ret = OB_SUCCESS;
@@ -2553,17 +2669,41 @@ static int parse_copy_options(const std::string &text, CopyOptions &opts)
     if (!read_identifier_token(part, p, name)) {
       ret = OB_ERR_PARSE_SQL;
     } else if (equal_ci(name, "header")) {
-      opts.header = true;
-      if (p != part.size()) {
+      if (!parse_header_option(part, p, opts.header)) {
         ret = OB_ERR_PARSE_SQL;
       }
     } else if (equal_ci(name, "format")) {
       std::string v;
-      if (!read_identifier_token(part, p, v) || !equal_ci(v, "csv")) {
+      bool ok = read_identifier_token(part, p, v) || read_string_token(part, p, v);
+      if (!ok || !equal_ci(v, "csv")) {
         ret = OB_NOT_SUPPORTED;
       }
-    } else if (equal_ci(name, "nullstr")) {
-      if (!read_string_token(part, p, opts.nullstr)) {
+    } else if (equal_ci(name, "delimiter") || equal_ci(name, "field_delimiter")
+               || equal_ci(name, "sep")) {
+      std::string v;
+      if (!read_option_string(part, p, v) || v.size() != 1) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        opts.delimiter = v;
+      }
+    } else if (equal_ci(name, "quote") || equal_ci(name, "quote_char")
+               || equal_ci(name, "field_optionally_enclosed_by")) {
+      std::string v;
+      if (!read_option_string(part, p, v) || v.size() > 1) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        opts.quote = v;
+      }
+    } else if (equal_ci(name, "escape") || equal_ci(name, "escape_char")) {
+      std::string v;
+      if (!read_option_string(part, p, v) || v.size() > 1) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        opts.escape = v;
+      }
+    } else if (equal_ci(name, "nullstr") || equal_ci(name, "null_string")
+               || equal_ci(name, "null")) {
+      if (!read_option_string(part, p, opts.nullstr)) {
         ret = OB_NOT_SUPPORTED;
       }
     } else {
@@ -2711,11 +2851,25 @@ static int compare_cells(const FileSqlCell &a, const FileSqlCell &b)
   return result;
 }
 
-static std::string csv_field(const std::string &v)
+static bool path_exists(const std::string &path)
 {
-  bool need_quote = v.empty();
+  struct stat st;
+  return 0 == ::stat(path.c_str(), &st);
+}
+
+static std::string csv_field(const std::string &v, const CopyOptions &opts, const bool force_quote)
+{
+  const char delimiter = opts.delimiter.empty() ? ',' : opts.delimiter[0];
+  const bool has_quote = !opts.quote.empty();
+  const char quote = has_quote ? opts.quote[0] : '"';
+  const bool has_escape = !opts.escape.empty();
+  const char escape = has_escape ? opts.escape[0] : '\\';
+  bool need_quote = has_quote && (v.empty() || force_quote);
   for (size_t i = 0; !need_quote && i < v.size(); ++i) {
-    if (',' == v[i] || '"' == v[i] || '\n' == v[i] || '\r' == v[i]) {
+    const char c = v[i];
+    if (c == delimiter || c == '\n' || c == '\r') {
+      need_quote = true;
+    } else if (has_quote && (c == quote || (has_escape && c == escape))) {
       need_quote = true;
     }
   }
@@ -2723,15 +2877,22 @@ static std::string csv_field(const std::string &v)
     return v;
   }
   std::string out;
-  out.push_back('"');
+  out.push_back(quote);
   for (size_t i = 0; i < v.size(); ++i) {
-    if ('"' == v[i]) {
-      out += "\"\"";
+    const char c = v[i];
+    if (has_escape && (c == escape || c == quote)) {
+      out.push_back(escape);
+      out.push_back(c);
+    } else if (!has_escape && c == quote) {
+      // Without an escape character the only portable way to keep a quote
+      // inside a quoted field is to double it.
+      out.push_back(quote);
+      out.push_back(quote);
     } else {
-      out.push_back(v[i]);
+      out.push_back(c);
     }
   }
-  out.push_back('"');
+  out.push_back(quote);
   return out;
 }
 
@@ -2742,14 +2903,18 @@ static bool write_copy_file(const std::string &path,
                             const CopyOptions &opts)
 {
   bool ok = true;
-  FILE *fp = ::fopen(path.c_str(), "wb");
+  const char delimiter = opts.delimiter.empty() ? ',' : opts.delimiter[0];
+  // Write next to the target and rename, so a failed export never leaves a
+  // half-written file under the requested name.
+  const std::string tmp_path = path + ".file_sql_tmp";
+  FILE *fp = ::fopen(tmp_path.c_str(), "wb");
   if (NULL == fp) {
     return false;
   }
   if (opts.header) {
-    for (size_t c = 0; c < projection.size(); ++c) {
-      const std::string field = csv_field(table.columns[projection[c]].name);
-      if (c > 0 && ::fputc(',', fp) == EOF) {
+    for (size_t c = 0; ok && c < projection.size(); ++c) {
+      const std::string field = csv_field(table.columns[projection[c]].name, opts, false);
+      if (c > 0 && ::fputc(delimiter, fp) == EOF) {
         ok = false;
       }
       if (ok && ::fwrite(field.data(), 1, field.size(), fp) != field.size()) {
@@ -2768,9 +2933,13 @@ static bool write_copy_file(const std::string &path,
       if (cell.is_null) {
         field = opts.nullstr;
       } else {
-        field = csv_field(cell.text);
+        // A text value that happens to spell the NULL marker must stay quoted,
+        // otherwise reading the file back would turn it into a NULL.
+        const bool force_quote = opts.nullstr.empty() ? (cell.text == "\\N")
+                                                      : (cell.text == opts.nullstr);
+        field = csv_field(cell.text, opts, force_quote);
       }
-      if (c > 0 && ::fputc(',', fp) == EOF) {
+      if (c > 0 && ::fputc(delimiter, fp) == EOF) {
         ok = false;
       }
       if (ok && ::fwrite(field.data(), 1, field.size(), fp) != field.size()) {
@@ -2783,6 +2952,12 @@ static bool write_copy_file(const std::string &path,
   }
   if (0 != ::fclose(fp)) {
     ok = false;
+  }
+  if (ok && 0 != ::rename(tmp_path.c_str(), path.c_str())) {
+    ok = false;
+  }
+  if (!ok) {
+    ::remove(tmp_path.c_str());
   }
   return ok;
 }
@@ -2895,7 +3070,89 @@ static int evaluate_copy_source(const ObSQLSessionInfo &session,
     return x < y;
   });
   if (!write_copy_file(out_path, table, projection, order, opts)) {
+    ret = OB_IO_ERROR;
+  }
+  return ret;
+}
+
+static bool contains_file_function(const std::string &sql);
+
+static bool is_table_reference(const std::string &text)
+{
+  bool ok = !text.empty();
+  for (size_t i = 0; ok && i < text.size(); ++i) {
+    const char c = text[i];
+    if (!is_ident_char(c) && '.' != c && '`' != c && ' ' != c && '\t' != c
+        && '\n' != c && '\r' != c) {
+      ok = false;
+    }
+  }
+  return ok;
+}
+
+static void append_copy_format(std::string &sql, const CopyOptions &opts)
+{
+  sql += " format = (type = 'CSV', field_delimiter = ";
+  sql += quote_sql_string(opts.delimiter.empty() ? std::string(",") : opts.delimiter);
+  if (!opts.quote.empty()) {
+    sql += ", field_optionally_enclosed_by = ";
+    sql += quote_sql_string(opts.quote);
+  }
+  if (!opts.escape.empty()) {
+    sql += ", escape = ";
+    sql += quote_sql_string(opts.escape);
+  }
+  if (opts.header) {
+    sql += ", parse_header = true";
+  }
+  // Always pin the NULL text, including the empty string, so a NULL column is
+  // distinct from an empty string when the file is read back.
+  sql += ", null_if = (";
+  sql += quote_sql_string(opts.nullstr);
+  sql += "))";
+}
+
+// Build the engine statement for COPY sources that are not a single file
+// function table. Executing through SELECT ... INTO OUTFILE keeps the export
+// inside the session (same database, transaction and privilege context), lets
+// the engine stream the rows, and reuses the CSV writer options.
+static int build_copy_outfile(const ObSQLSessionInfo &session,
+                              const std::string &inner,
+                              const std::string &path,
+                              const CopyOptions &opts,
+                              std::string &output)
+{
+  int ret = OB_SUCCESS;
+  std::string select_sql = trim(inner);
+  if (select_sql.empty()) {
     ret = OB_ERR_PARSE_SQL;
+  } else {
+    size_t first = 0;
+    std::string word;
+    const bool is_query = read_identifier_token(select_sql, first, word)
+                          && (equal_ci(word, "select") || equal_ci(word, "with")
+                              || equal_ci(word, "values") || equal_ci(word, "table"));
+    if (is_query) {
+      // keep the query text as written
+    } else if (!is_table_reference(select_sql)) {
+      ret = OB_ERR_PARSE_SQL;
+    } else {
+      select_sql = "select * from " + select_sql;
+    }
+  }
+  if (OB_SUCC(ret) && contains_file_function(select_sql)) {
+    std::string rewritten_select;
+    bool found = false;
+    ret = rewrite_file_functions(session, select_sql, rewritten_select, NULL, found);
+    if (OB_SUCC(ret) && found) {
+      select_sql = rewritten_select;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    output = select_sql;
+    output += " into outfile ";
+    output += quote_sql_string(path);
+    append_copy_format(output, opts);
   }
   return ret;
 }
@@ -2944,16 +3201,30 @@ static int rewrite_copy(const ObSQLSessionInfo &session,
     ret = parse_copy_options(sql.substr(p + 1, opt_close - p - 1), opts);
     p = opt_close + 1;
   }
-  if (OB_SUCCESS == ret) {
-    ret = evaluate_copy_source(session, inner, path, opts);
+  if (OB_SUCC(ret) && path_exists(path)) {
+    // SELECT INTO OUTFILE refuses to clobber an existing file; COPY keeps the
+    // same contract instead of silently replacing someone else's data.
+    ret = OB_FILE_ALREADY_EXIST;
   }
-  if (OB_SUCCESS == ret) {
-    // The file is already written above, so the statement sent on to the
-    // executor only has to succeed. It must not return a result set: clients
-    // print the column header even when a result set has no rows, and COPY is
-    // expected to answer with a plain OK packet.
-    output = "set @ob_file_sql_copy_done = 1";
-    rewritten = true;
+  if (OB_SUCC(ret)) {
+    // A plain scan of one file function is answered in place: the file is read
+    // once here and never has to travel through the SQL layer. Any other
+    // source (real tables, joins, aggregates) is handed to the engine as
+    // SELECT ... INTO OUTFILE so it streams instead of being materialized.
+    const int local_ret = evaluate_copy_source(session, inner, path, opts);
+    if (OB_SUCCESS == local_ret) {
+      // The file is already written above, so the statement sent on to the
+      // executor only has to succeed. It must not return a result set: clients
+      // print the column header even when a result set has no rows, and COPY is
+      // expected to answer with a plain OK packet.
+      output = "set @ob_file_sql_copy_done = 1";
+      rewritten = true;
+    } else if (OB_NOT_SUPPORTED == local_ret) {
+      ret = build_copy_outfile(session, inner, path, opts, output);
+      rewritten = (OB_SUCCESS == ret);
+    } else {
+      ret = local_ret;
+    }
   }
   return ret;
 }
@@ -3024,6 +3295,10 @@ static void log_file_sql_error(const int code)
 {
   if (OB_NOT_SUPPORTED == code) {
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table function");
+  } else if (OB_FILE_ALREADY_EXIST == code) {
+    LOG_USER_ERROR(OB_FILE_ALREADY_EXIST);
+  } else if (OB_IO_ERROR == code) {
+    LOG_USER_ERROR(OB_IO_ERROR);
   } else {
     const char *msg = "invalid file table function";
     LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),

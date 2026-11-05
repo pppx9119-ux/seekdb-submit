@@ -6815,6 +6815,13 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(stmt->get_select_exprs(select_exprs))) {
     } else if (OB_FAIL(select_into->get_select_exprs().assign(select_exprs))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_select_item_size(); ++i) {
+        const SelectItem &item = stmt->get_select_item(i);
+        const ObString &name = item.alias_name_.empty() ? item.expr_name_ : item.alias_name_;
+        if (OB_FAIL(select_into->get_select_names().push_back(name))) {
+        }
+      }
     }
     if (OB_SUCC(ret)) {
       select_into->set_into_type(into_item->into_type_);
