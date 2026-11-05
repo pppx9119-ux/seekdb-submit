@@ -2948,7 +2948,11 @@ static int rewrite_copy(const ObSQLSessionInfo &session,
     ret = evaluate_copy_source(session, inner, path, opts);
   }
   if (OB_SUCCESS == ret) {
-    output = "select 1 from dual where 1 = 0";
+    // The file is already written above, so the statement sent on to the
+    // executor only has to succeed. It must not return a result set: clients
+    // print the column header even when a result set has no rows, and COPY is
+    // expected to answer with a plain OK packet.
+    output = "set @ob_file_sql_copy_done = 1";
     rewritten = true;
   }
   return ret;

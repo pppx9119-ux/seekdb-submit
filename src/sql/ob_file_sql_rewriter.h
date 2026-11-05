@@ -30,7 +30,7 @@ class ObSQLSessionInfo;
 // executor already understand:
 //   read_csv/read_json/read_ndjson/read_parquet/glob(...) -> derived table of literals
 //   DESCRIBE SELECT ... FROM file(...)                   -> metadata result set
-//   COPY (query) TO 'path' (format csv, ...)             -> SELECT ... INTO OUTFILE
+//   COPY (query) TO 'path' (format csv, ...)             -> file written, OK packet
 class ObFileSqlRewriter
 {
 public:
