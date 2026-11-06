@@ -29,6 +29,8 @@
 #include "storage/fts/ob_ngram_ft_parser.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
 #include "storage/fts/ob_fts_stop_word.h"
+#include "lib/hash_func/murmur_hash.h"
+#include "lib/lock/ob_mutex.h"
 #include "storage/fts/ob_whitespace_ft_parser.h"
 
 namespace oceanbase
@@ -509,6 +511,99 @@ int ObFTParseHelper::set_add_word_flag(const ObIFTParserDesc &ftparser_desc)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(ftparser_desc.get_add_word_flag(add_word_flag_))) {
+  }
+  return ret;
+}
+
+ObFTTokenizeResultCache &ObFTTokenizeResultCache::instance()
+{
+  static ObFTTokenizeResultCache cache;
+  return cache;
+}
+
+ObFTTokenizeResultCache::ObFTTokenizeResultCache()
+    : allocator_(lib::ObMemAttr("FTTokenizeCache")),
+      lock_(),
+      entry_cnt_(0),
+      used_bytes_(0)
+{
+  MEMSET(buckets_, 0, sizeof(buckets_));
+}
+
+void ObFTTokenizeResultCache::reset_locked()
+{
+  allocator_.reset();
+  MEMSET(buckets_, 0, sizeof(buckets_));
+  entry_cnt_ = 0;
+  used_bytes_ = 0;
+}
+
+int ObFTTokenizeResultCache::get(const common::ObString &key,
+                                 common::ObIAllocator &allocator,
+                                 common::ObString &value)
+{
+  int ret = OB_SUCCESS;
+  value.reset();
+  if (OB_UNLIKELY(key.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const uint64_t hash_val = common::murmurhash(key.ptr(), key.length(), 0);
+    bool found = false;
+    lib::ObMutexGuard guard(lock_);
+    for (Entry *entry = buckets_[hash_val % BUCKET_CNT];
+         OB_SUCC(ret) && !found && nullptr != entry;
+         entry = entry->next_) {
+      if (entry->hash_ == hash_val && entry->key_len_ == key.length()
+          && 0 == MEMCMP(entry->key_, key.ptr(), key.length())) {
+        char *buf = static_cast<char *>(allocator.alloc(entry->value_len_));
+        if (OB_ISNULL(buf)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else {
+          MEMCPY(buf, entry->value_, entry->value_len_);
+          value.assign_ptr(buf, static_cast<int32_t>(entry->value_len_));
+          found = true;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && !found) {
+      ret = OB_HASH_NOT_EXIST;
+    }
+  }
+  return ret;
+}
+
+int ObFTTokenizeResultCache::put(const common::ObString &key, const common::ObString &value)
+{
+  int ret = OB_SUCCESS;
+  const int64_t cached_bytes = key.length() + value.length();
+  if (OB_UNLIKELY(key.empty() || value.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (cached_bytes > MAX_CACHE_BYTES) {
+    // A single entry larger than the whole cache is not worth holding on to.
+  } else {
+    const uint64_t hash_val = common::murmurhash(key.ptr(), key.length(), 0);
+    lib::ObMutexGuard guard(lock_);
+    if (entry_cnt_ >= MAX_ENTRY_CNT || used_bytes_ + cached_bytes > MAX_CACHE_BYTES) {
+      reset_locked();
+    }
+    Entry *entry = static_cast<Entry *>(allocator_.alloc(sizeof(Entry)));
+    char *key_buf = static_cast<char *>(allocator_.alloc(key.length()));
+    char *value_buf = static_cast<char *>(allocator_.alloc(value.length()));
+    if (OB_ISNULL(entry) || OB_ISNULL(key_buf) || OB_ISNULL(value_buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(key_buf, key.ptr(), key.length());
+      MEMCPY(value_buf, value.ptr(), value.length());
+      entry->next_ = buckets_[hash_val % BUCKET_CNT];
+      entry->hash_ = hash_val;
+      entry->key_len_ = key.length();
+      entry->value_len_ = value.length();
+      entry->key_ = key_buf;
+      entry->value_ = value_buf;
+      buckets_[hash_val % BUCKET_CNT] = entry;
+      ++entry_cnt_;
+      used_bytes_ += cached_bytes;
+    }
   }
   return ret;
 }

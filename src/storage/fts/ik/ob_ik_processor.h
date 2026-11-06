@@ -103,6 +103,16 @@ public:
 
   int process(TokenizeContext &ctx);
 
+  // The caller may already have fetched the current char, avoid fetching it
+  // again for every processor in the char loop.
+  int process(TokenizeContext &ctx,
+              const char *ch,
+              const uint8_t char_len,
+              const ObFTCharUtil::CharType type)
+  {
+    return do_process(ctx, ch, char_len, type);
+  }
+
   virtual int do_process(TokenizeContext &ctx,
                          const char *ch,
                          const uint8_t char_len,

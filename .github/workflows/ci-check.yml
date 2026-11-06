@@ -1,0 +1,437 @@
+name: SeekDB full build and FTS benchmark
+
+# Cloud-side verification for the full-text index performance work.
+#
+# The branch is based on the official 2026-competition baseline.  This job
+# initializes the packaged third-party dependencies, configures the release
+# CMake build, compiles and links the complete `seekdb` executable, starts the
+# server and runs the repository's official FTS benchmark
+# (tools/benchmark/fts_large_bench.sh) with the baseline parameters.
+#
+# It then checks out the competition baseline commit, rebuilds only the changed
+# translation units in the same build directory, and runs the same benchmark on
+# the same runner.  The two reports therefore form a controlled before/after
+# comparison; the official benchmark scripts, data and scoring inputs are not
+# modified.
+#
+# Debug info is stripped (-g0) only to keep the build inside the hosted
+# runner's disk budget; the optimisation level and NDEBUG match the release
+# build produced by `build.sh release`.  Compilation retries automatically
+# with lower parallelism if the runner runs out of memory.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - competition/fts-perf-v2
+    paths:
+      - '.github/workflows/ci-check.yml'
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'build.sh'
+      - 'cmake/**'
+      - 'deps/init/**'
+      - 'tools/cmake/**'
+      - 'rust/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seekdb-fts-perf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 4G
+  CCACHE_COMPRESS: 1
+  BASELINE_SHA: 5bce9e06d1281347ad61344e4b01fab9158c58a2
+
+jobs:
+  build-and-benchmark:
+    name: Full build and FTS benchmark
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+
+    steps:
+      - name: Free disk space
+        uses: insightsengineering/disk-space-reclaimer@v1
+        with:
+          tools-cache: false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build prerequisites
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y git wget rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5 python3
+
+      - name: Add swap space
+        run: |
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h /
+          nproc
+
+      - name: Restore third-party dependencies
+        id: deps-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: deps/3rd
+          key: seekdb-deps-el9-x86_64-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+
+      - name: Restore Rust build artifacts
+        id: rust-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build_release/rust-target
+          key: seekdb-rust-release-${{ hashFiles('rust/**', 'cmake/Rust.cmake') }}
+
+      - name: Restore compiler cache
+        id: ccache-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: seekdb-fts-ccache-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            seekdb-fts-ccache-
+
+      - name: Initialize dependencies and configure CMake
+        run: |
+          ./build.sh release --init \
+            -DOB_USE_CCACHE=ON \
+            -DNEED_PARSER_CACHE=OFF \
+            "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O2 -g0 -DNDEBUG" \
+            "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -g0 -DNDEBUG"
+
+      - name: Save third-party dependencies
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: deps/3rd
+          key: seekdb-deps-el9-x86_64-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+
+      - name: Save Rust build artifacts
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: build_release/rust-target
+          key: seekdb-rust-release-${{ hashFiles('rust/**', 'cmake/Rust.cmake') }}
+
+      - name: Build seekdb binary (branch)
+        timeout-minutes: 315
+        run: |
+          set -uo pipefail
+          export PATH="$PWD/deps/3rd/usr/local/oceanbase/devtools/bin:$PATH"
+          which ccache
+          ccache -s || true
+          cd build_release || exit 1
+
+          rc=1
+          for jobs in 4 3 2 1; do
+            log="$GITHUB_WORKSPACE/build-j${jobs}.log"
+            echo "=== make -j${jobs} seekdb ($(date -u +%H:%M:%S)) ==="
+            started=$(date +%s)
+            make -j"${jobs}" seekdb > "$log" 2>&1 &
+            make_pid=$!
+            (
+              while kill -0 "$make_pid" 2>/dev/null; do
+                sleep 300
+                if kill -0 "$make_pid" 2>/dev/null; then
+                  built=$(grep -c "Building CXX object" "$log" 2>/dev/null || true)
+                  echo "[progress] $(date -u +%H:%M:%S) compiled objects: ${built:-0}"
+                fi
+              done
+            ) &
+            reporter=$!
+
+            set +e
+            wait "$make_pid"
+            rc=$?
+            set -e
+            kill "$reporter" 2>/dev/null || true
+            wait "$reporter" 2>/dev/null || true
+
+            echo "make -j${jobs} exited with ${rc} after $(( $(date +%s) - started ))s"
+            if [ "$rc" -eq 0 ]; then
+              break
+            fi
+            tail -n 150 "$log"
+            if grep -qE "Killed signal|Killed|out of memory|virtual memory exhausted|internal compiler error|Error 137" "$log"; then
+              echo "resource exhaustion detected; retrying with lower parallelism"
+              continue
+            fi
+            echo "build failed for a non-resource reason"
+            exit "$rc"
+          done
+
+          if [ "$rc" -ne 0 ]; then
+            echo "all build attempts failed"
+            exit "$rc"
+          fi
+          ls -lh src/observer/seekdb
+
+      - name: Save compiler cache
+        if: always() && steps.ccache-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: seekdb-fts-ccache-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify built binary
+        run: |
+          ls -lh build_release/src/observer/seekdb
+          build_release/src/observer/seekdb --version
+
+      - name: Run FTS benchmark (branch)
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          CLIENT_ROOT="$PWD/deps/3rd/u01/obclient"
+          export PATH="$CLIENT_ROOT/bin:$PATH"
+          export LD_LIBRARY_PATH="$CLIENT_ROOT/lib:$CLIENT_ROOT/lib64:${LD_LIBRARY_PATH:-}"
+          INSTANCE="$PWD/.bench_instance"
+          cleanup() {
+            python3 .github/script/seekdb/sdb.py stop --base-dir "$INSTANCE" || true
+          }
+          trap cleanup EXIT
+
+          rm -rf "$INSTANCE"
+          python3 .github/script/seekdb/sdb.py start \
+            --binary "$PWD/build_release/src/observer/seekdb" \
+            --base-dir "$INSTANCE" \
+            --port 2881
+          python3 .github/script/seekdb/sdb.py wait-ready \
+            --client "$CLIENT_ROOT/bin/obclient" \
+            --base-dir "$INSTANCE" \
+            --host 127.0.0.1 \
+            --port 2881 \
+            --user root \
+            --timeout 600
+
+          MYSQL="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -N -s -A --default-character-set=utf8mb4" \
+          MYSQL_VERBOSE="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4" \
+          LABEL=branch \
+          OUTPUT="$GITHUB_WORKSPACE/fts_bench_after.txt" \
+          bash tools/benchmark/fts_large_bench.sh
+
+      - name: Run official FTS mysqltests (branch)
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          CLIENT_ROOT="/mnt/d/oceanbase_work/PowerContext-2026/deps/3rd/u01/obclient"
+          INSTANCE="/mnt/d/oceanbase_work/PowerContext-2026/.test_instance"
+          LOG_DIR="/mysqltest-logs"
+          rm -rf "" ""
+          mkdir -p ""
+          cleanup() {
+            python3 .github/script/seekdb/sdb.py stop --base-dir "" || true
+          }
+          trap cleanup EXIT
+
+          python3 .github/script/seekdb/sdb.py start             --binary "/mnt/d/oceanbase_work/PowerContext-2026/build_release/src/observer/seekdb"             --base-dir ""             --port 2881
+          python3 .github/script/seekdb/sdb.py wait-ready             --client "/bin/obclient"             --base-dir ""             --host 127.0.0.1             --port 2881             --user root             --timeout 600
+
+          "/bin/obclient" -h127.0.0.1 -P2881 -uroot -A < tools/deploy/init.sql
+          "/bin/obclient" -h127.0.0.1 -P2881 -uroot -A < tools/deploy/init_user.sql
+
+          CASE_DIR="tools/deploy/mysql_test/test_suite/fts_index"
+          failed=0
+          for test_file in ""/t/*.test; do
+            case_name=""""
+            echo "::group::fts_index."
+            if ! "/bin/mysqltest"                 --host=127.0.0.1 --port=2881 --user=admin --password=admin                 --database=test --tmpdir="" --logdir="" --silent                 --test-file=""                 --result-file="/r/mysql/.result"                 --timer-file="/timer" --tail-lines=40; then
+              echo "FAILED fts_index."
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          if [ "" != "0" ]; then
+            echo "official fts_index suite failed"
+            exit 1
+          fi
+
+      - name: Check out competition baseline for comparison
+        id: baseline-checkout
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo "GITHUB_SHA=$GITHUB_SHA"
+
+          if ! git cat-file -e "${BASELINE_SHA}^{commit}" 2>/dev/null; then
+            if ! git fetch --depth=1 origin "$BASELINE_SHA"; then
+              git fetch --depth=1 https://github.com/oceanbase/seekdb.git 2026-competition
+              test "$(git rev-parse FETCH_HEAD)" = "$BASELINE_SHA"
+            fi
+          fi
+
+          git checkout --detach "$BASELINE_SHA"
+          git log -1 --format='baseline checkout: %H %s'
+
+      - name: Rebuild seekdb binary (baseline, incremental)
+        id: baseline-build
+        if: steps.baseline-checkout.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 120
+        run: |
+          set -uo pipefail
+          export PATH="$PWD/deps/3rd/usr/local/oceanbase/devtools/bin:$PATH"
+          cd build_release || exit 1
+
+          rc=1
+          for jobs in 4 2 1; do
+            log="$GITHUB_WORKSPACE/baseline-build-j${jobs}.log"
+            echo "=== baseline make -j${jobs} seekdb ($(date -u +%H:%M:%S)) ==="
+            started=$(date +%s)
+            set +e
+            make -j"${jobs}" seekdb > "$log" 2>&1
+            rc=$?
+            set -e
+            echo "baseline make -j${jobs} exited with ${rc} after $(( $(date +%s) - started ))s"
+            if [ "$rc" -eq 0 ]; then
+              break
+            fi
+            tail -n 150 "$log"
+            if grep -qE "Killed signal|Killed|out of memory|virtual memory exhausted|internal compiler error|Error 137" "$log"; then
+              echo "resource exhaustion detected; retrying with lower parallelism"
+              continue
+            fi
+            exit "$rc"
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "baseline build failed"
+            exit "$rc"
+          fi
+          ls -lh src/observer/seekdb
+
+      - name: Run FTS benchmark (baseline)
+        if: steps.baseline-build.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          CLIENT_ROOT="$PWD/deps/3rd/u01/obclient"
+          export PATH="$CLIENT_ROOT/bin:$PATH"
+          export LD_LIBRARY_PATH="$CLIENT_ROOT/lib:$CLIENT_ROOT/lib64:${LD_LIBRARY_PATH:-}"
+          INSTANCE="$PWD/.bench_instance"
+          cleanup() {
+            python3 .github/script/seekdb/sdb.py stop --base-dir "$INSTANCE" || true
+          }
+          trap cleanup EXIT
+
+          rm -rf "$INSTANCE"
+          python3 .github/script/seekdb/sdb.py start \
+            --binary "$PWD/build_release/src/observer/seekdb" \
+            --base-dir "$INSTANCE" \
+            --port 2881
+          python3 .github/script/seekdb/sdb.py wait-ready \
+            --client "$CLIENT_ROOT/bin/obclient" \
+            --base-dir "$INSTANCE" \
+            --host 127.0.0.1 \
+            --port 2881 \
+            --user root \
+            --timeout 600
+
+          MYSQL="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -N -s -A --default-character-set=utf8mb4" \
+          MYSQL_VERBOSE="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4" \
+          LABEL=baseline \
+          OUTPUT="$GITHUB_WORKSPACE/fts_bench_before.txt" \
+          bash tools/benchmark/fts_large_bench.sh
+
+      - name: Score branch report against the official baseline
+        if: always()
+        run: |
+          if [ -f fts_bench_after.txt ]; then
+            python3 tools/benchmark/fts_large_bench_score.py \
+              fts_bench_after.txt | tee fts_bench_after_score.txt || true
+          fi
+
+      - name: Compare baseline and branch reports
+        if: always()
+        run: |
+          python3 - "$PWD/fts_bench_before.txt" "$PWD/fts_bench_after.txt" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          metric_re = re.compile(r"^\s*([A-Za-z0-9_]+):\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*$")
+
+          def load(path):
+              p = Path(path)
+              if not p.is_file():
+                  return {}
+              out = {}
+              for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                  m = metric_re.match(line)
+                  if m:
+                      out[m.group(1)] = float(m.group(2))
+              return out
+
+          before = load(sys.argv[1])
+          after = load(sys.argv[2])
+          groups = {
+              "build": ["build_ik_all_sec", "build_ik_content_sec", "build_beng_en_sec"],
+              "tokenize": ["tokenize_ik_avg_ms", "tokenize_beng_avg_ms"],
+              "query": ["query_cn_avg_ms", "query_beng_avg_ms",
+                        "query_mixed_avg_ms", "query_limit_avg_ms"],
+          }
+
+          if not before or not after:
+              print("before/after comparison skipped: report missing")
+              print(f"  baseline report: {'present' if before else 'missing'}")
+              print(f"  branch report:   {'present' if after else 'missing'}")
+              raise SystemExit(0)
+
+          print("FTS benchmark before/after (same runner)")
+          print("========================================")
+          category_improvements = []
+          for category, metrics in groups.items():
+              improvements = []
+              print(f"[{category}]")
+              for name in metrics:
+                  if name not in before or name not in after:
+                      print(f"  {name}: missing")
+                      continue
+                  base = before[name]
+                  cur = after[name]
+                  imp = (base - cur) / base if base > 0 else 0.0
+                  improvements.append(imp)
+                  print(f"  {name}: baseline={base:.4f} branch={cur:.4f} improvement={imp * 100:.2f}%")
+              if improvements:
+                  avg = sum(improvements) / len(improvements)
+                  category_improvements.append(avg)
+                  print(f"  {category}_improvement: {avg * 100:.2f}%")
+          if category_improvements:
+              mean_imp = sum(category_improvements) / len(category_improvements)
+              print(f"mean_category_improvement: {mean_imp * 100:.2f}%")
+          print("========================================")
+          PY
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fts-benchmark-reports
+          path: |
+            fts_bench_after.txt
+            fts_bench_before.txt
+            fts_bench_after_score.txt
+            build-j*.log
+            baseline-build-j*.log
+          if-no-files-found: warn
+
+      - name: Stop seekdb
+        if: always()
+        run: python3 .github/script/seekdb/sdb.py stop --base-dir "$PWD/.bench_instance" || true

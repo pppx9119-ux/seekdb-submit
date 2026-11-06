@@ -98,6 +98,16 @@ private:
                                common::ObIAllocator &allocator,
                                ObIJsonBase *&result);
 
+  // The key covers everything that may change the token set of a text.
+  static int build_cache_key(common::ObIAllocator &allocator,
+                             const TokenizeParam &param,
+                             common::ObString &key);
+
+  // Stores the serialized json so an identical request can skip segmentation.
+  static int cache_tokenize_result(const common::ObString &key,
+                                   ObIJsonBase *json_result,
+                                   common::ObIAllocator &allocator);
+
   static int construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param);
 
 private:

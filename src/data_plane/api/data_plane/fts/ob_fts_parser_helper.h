@@ -18,7 +18,9 @@
 #define OB_FTS_PARSER_HELPER_H_
 
 #include "lib/allocator/ob_fifo_allocator.h"
+#include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
+#include "lib/lock/ob_mutex.h"
 #include "lib/string/ob_string.h"
 #include "object/ob_object.h"
 #include "data_plane/fts/ob_fts_parser.h"
@@ -229,6 +231,65 @@ private:
   static constexpr const char *ENTRY_NAME_DOC_LEN = "doc_len";
   static constexpr const char *ENTRY_NAME_TOKENS = "tokens";
   DISALLOW_COPY_AND_ASSIGN(ObFTParseHelper);
+};
+
+/**
+ * A process wide cache of tokenize() results.
+ *
+ * The built-in dictionaries are immutable once they are loaded, so the token
+ * set of a text depends only on the parser configuration, the collation and the
+ * text itself. A request that repeats an earlier combination, for example when
+ * the same document is indexed again or the same expression is evaluated once
+ * more, reuses the serialized json instead of running the segmenter and
+ * rebuilding the json document.
+ */
+class ObFTTokenizeResultCache final
+{
+public:
+  static constexpr int64_t BUCKET_CNT = 128;
+  static constexpr int64_t MAX_ENTRY_CNT = 512;
+  static constexpr int64_t MAX_CACHE_BYTES = 4 * 1024 * 1024;
+
+  struct Entry final
+  {
+    Entry() : next_(nullptr), hash_(0), key_len_(0), value_len_(0), key_(nullptr), value_(nullptr) {}
+    struct Entry *next_;
+    uint64_t hash_;
+    int64_t key_len_;
+    int64_t value_len_;
+    const char *key_;
+    const char *value_;
+  };
+
+public:
+  static ObFTTokenizeResultCache &instance();
+
+  /**
+   * @param[in] key, built from the parser configuration and the text
+   * @param[in] allocator, owns the returned value
+   * @param[out] value, serialized json produced by the same request earlier
+   * @return OB_HASH_NOT_EXIST when the request was never cached
+   */
+  int get(const common::ObString &key, common::ObIAllocator &allocator, common::ObString &value);
+  int put(const common::ObString &key, const common::ObString &value);
+
+public:
+  ~ObFTTokenizeResultCache() = default;
+
+private:
+  ObFTTokenizeResultCache();
+
+  // Drops every entry, the cache is rebuilt by later requests.
+  void reset_locked();
+
+private:
+  common::ObArenaAllocator allocator_;
+  lib::ObMutex lock_;
+  struct Entry *buckets_[BUCKET_CNT];
+  int64_t entry_cnt_;
+  int64_t used_bytes_;
+
+  DISALLOW_COPY_AND_ASSIGN(ObFTTokenizeResultCache);
 };
 
 } // end namespace storage

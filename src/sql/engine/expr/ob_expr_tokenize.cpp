@@ -59,19 +59,108 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
 
   ObIJsonBase *json_result = nullptr;
   TokenizeParam param;
+  ObString cache_key;
+  ObString cached_value;
+  bool cache_hit = false;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
+  } else if (OB_FAIL(build_cache_key(temp_allocator, param, cache_key))) {
+  } else {
+    const int cache_ret =
+        storage::ObFTTokenizeResultCache::instance().get(cache_key, temp_allocator, cached_value);
+    if (OB_SUCCESS == cache_ret) {
+      cache_hit = true;
+    } else if (OB_HASH_NOT_EXIST != cache_ret) {
+      LOG_WARN("failed to read the tokenize result cache, tokenize again", K(cache_ret));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (cache_hit) {
+    if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, cached_value))) {
+    }
   } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
   } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
                                                      ctx,
                                                      temp_allocator,
                                                      json_result,
                                                      expr_datum))) {
+  } else if (OB_FAIL(cache_tokenize_result(cache_key, json_result, temp_allocator))) {
+    // The cache is an optimization only, never fail the query because of it.
+    LOG_WARN("failed to cache the tokenize result", K(ret));
+    ret = OB_SUCCESS;
   }
 
+  return ret;
+}
+
+int ObExprTokenize::build_cache_key(common::ObIAllocator &allocator,
+                                    const TokenizeParam &param,
+                                    common::ObString &key)
+{
+  int ret = OB_SUCCESS;
+  const int64_t fixed_len = static_cast<int64_t>(sizeof(int32_t)) * 4;
+  const int64_t key_len = fixed_len + param.parser_name_.length() + param.properties_.length()
+                          + param.fulltext_.length();
+  char *buf = static_cast<char *>(allocator.alloc(key_len));
+  if (OB_ISNULL(buf)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    int32_t coll_type = static_cast<int32_t>(param.meta_.get_collation_type());
+    int32_t output_mode = static_cast<int32_t>(param.output_mode_);
+    int32_t parser_len = param.parser_name_.length();
+    int32_t properties_len = param.properties_.length();
+    int64_t pos = 0;
+    MEMCPY(buf + pos, &coll_type, sizeof(int32_t));
+    pos += sizeof(int32_t);
+    MEMCPY(buf + pos, &output_mode, sizeof(int32_t));
+    pos += sizeof(int32_t);
+    MEMCPY(buf + pos, &parser_len, sizeof(int32_t));
+    pos += sizeof(int32_t);
+    MEMCPY(buf + pos, &properties_len, sizeof(int32_t));
+    pos += sizeof(int32_t);
+    if (parser_len > 0) {
+      MEMCPY(buf + pos, param.parser_name_.ptr(), parser_len);
+      pos += parser_len;
+    }
+    if (properties_len > 0) {
+      MEMCPY(buf + pos, param.properties_.ptr(), properties_len);
+      pos += properties_len;
+    }
+    if (param.fulltext_.length() > 0) {
+      MEMCPY(buf + pos, param.fulltext_.ptr(), param.fulltext_.length());
+      pos += param.fulltext_.length();
+    }
+    key.assign_ptr(buf, static_cast<int32_t>(key_len));
+  }
+  return ret;
+}
+
+int ObExprTokenize::cache_tokenize_result(const common::ObString &key,
+                                          ObIJsonBase *json_result,
+                                          common::ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  bool need_pack_diff = false;
+  ObString raw_binary;
+
+  if (OB_ISNULL(json_result) || key.empty()) {
+    // nothing to cache
+  } else if (!json_result->is_bin()) {
+    // a tree document is serialized the same way, nothing to check
+  } else if (OB_FAIL(static_cast<ObJsonBin *>(json_result)->should_pack_diff(need_pack_diff))) {
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(json_result) || key.empty() || need_pack_diff) {
+    // Nothing to cache, or the document is a partial update diff rather than
+    // a self contained result.
+  } else if (OB_FAIL(ObJsonWrapper::get_raw_binary(json_result, raw_binary, &allocator))) {
+  } else if (OB_FAIL(storage::ObFTTokenizeResultCache::instance().put(key, raw_binary))) {
+  }
   return ret;
 }
 
