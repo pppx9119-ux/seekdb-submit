@@ -228,40 +228,51 @@ jobs:
           bash tools/benchmark/fts_large_bench.sh
 
       - name: Run official FTS mysqltests (branch)
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           set -euo pipefail
-          CLIENT_ROOT="/mnt/d/oceanbase_work/PowerContext-2026/deps/3rd/u01/obclient"
-          INSTANCE="/mnt/d/oceanbase_work/PowerContext-2026/.test_instance"
-          LOG_DIR="/mysqltest-logs"
-          rm -rf "" ""
-          mkdir -p ""
-          cleanup() {
-            python3 .github/script/seekdb/sdb.py stop --base-dir "" || true
-          }
-          trap cleanup EXIT
+          python3 - <<"PY"
+          import pathlib, sys, types
 
-          python3 .github/script/seekdb/sdb.py start             --binary "/mnt/d/oceanbase_work/PowerContext-2026/build_release/src/observer/seekdb"             --base-dir ""             --port 2881
-          python3 .github/script/seekdb/sdb.py wait-ready             --client "/bin/obclient"             --base-dir ""             --host 127.0.0.1             --port 2881             --user root             --timeout 600
+          repo_root = pathlib.Path.cwd()
+          sys.path.insert(0, str(repo_root / ".github" / "script" / "seekdb"))
+          import mysqltest_for_seekdb as runner
 
-          "/bin/obclient" -h127.0.0.1 -P2881 -uroot -A < tools/deploy/init.sql
-          "/bin/obclient" -h127.0.0.1 -P2881 -uroot -A < tools/deploy/init_user.sql
+          deploy_dir = repo_root / "tools" / "deploy"
+          client_root = repo_root / "deps" / "3rd" / "u01" / "obclient"
+          args = types.SimpleNamespace(
+              seekdb=str(repo_root / "build_release" / "src" / "observer" / "seekdb"),
+              obclient=client_root / "bin" / "obclient",
+              mysqltest=client_root / "bin" / "mysqltest",
+              base_dir=repo_root / ".test_instance",
+              work_dir=repo_root / "mysqltest-work",
+              host="127.0.0.1",
+              port=2881,
+          )
+          for path in (args.obclient, args.mysqltest):
+              if not path.is_file():
+                  raise SystemExit("missing client binary: {}".format(path))
 
-          CASE_DIR="tools/deploy/mysql_test/test_suite/fts_index"
-          failed=0
-          for test_file in ""/t/*.test; do
-            case_name=""""
-            echo "::group::fts_index."
-            if ! "/bin/mysqltest"                 --host=127.0.0.1 --port=2881 --user=admin --password=admin                 --database=test --tmpdir="" --logdir="" --silent                 --test-file=""                 --result-file="/r/mysql/.result"                 --timer-file="/timer" --tail-lines=40; then
-              echo "FAILED fts_index."
-              failed=1
-            fi
-            echo "::endgroup::"
-          done
-          if [ "" != "0" ]; then
-            echo "official fts_index suite failed"
-            exit 1
-          fi
+          runner.prepare_instance(args, repo_root, repo_root / ".github" / "script" / "seekdb" / "sdb.py", deploy_dir)
+
+          cases = [c for c in runner.discover_cases(repo_root) if c.name.startswith("fts_index.")]
+          print("running {} fts_index cases".format(len(cases)), flush=True)
+          tmp_dir = args.work_dir / "tmp"
+          log_dir = args.work_dir / "log"
+          tmp_dir.mkdir(parents=True, exist_ok=True)
+          log_dir.mkdir(parents=True, exist_ok=True)
+
+          failed = []
+          for case in cases:
+              return_code, output = runner.run_case(args, deploy_dir, case, tmp_dir, log_dir)
+              if return_code != 0:
+                  failed.append(case.name)
+                  print(output, flush=True)
+
+          if failed:
+              raise SystemExit("failed cases: {}".format(", ".join(failed)))
+          print("all fts_index cases passed", flush=True)
+          PY
 
       - name: Check out competition baseline for comparison
         id: baseline-checkout
