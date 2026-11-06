@@ -227,6 +227,24 @@ jobs:
           OUTPUT="$GITHUB_WORKSPACE/fts_bench_after.txt" \
           bash tools/benchmark/fts_large_bench.sh
 
+      - name: Collect seekdb logs on failure
+        if: failure()
+        run: |
+          set +e
+          mkdir -p "$GITHUB_WORKSPACE/seekdb-logs"
+          for dir in "$PWD/.bench_instance" "$PWD/.test_instance"; do
+            [ -d "$dir" ] || continue
+            tag=$(basename "$dir")
+            find "$dir" -type f -name 'observer.log*' | while read -r f; do
+              out="$GITHUB_WORKSPACE/seekdb-logs/${tag}-$(basename "$f").tail"
+              tail -c 4000000 "$f" > "$out"
+            done
+            find "$dir" -type f \( -name 'observer.log*' -o -name '*.log' \) -print0 2>/dev/null |
+              xargs -0 -r grep -h -a -E 'CRASH|FATAL|ERROR|signal [0-9]+|Traceback' 2>/dev/null |
+              tail -n 3000 > "$GITHUB_WORKSPACE/seekdb-logs/${tag}-errors.txt"
+          done
+          ls -lR "$GITHUB_WORKSPACE/seekdb-logs" || true
+
       - name: Run official FTS mysqltests (branch)
         timeout-minutes: 90
         run: |
@@ -441,6 +459,7 @@ jobs:
             fts_bench_after_score.txt
             build-j*.log
             baseline-build-j*.log
+            seekdb-logs/**
           if-no-files-found: warn
 
       - name: Stop seekdb

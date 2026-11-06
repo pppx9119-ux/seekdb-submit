@@ -48,6 +48,7 @@ struct ObTextRetrievalInfo
     topk_offset_expr_(NULL),
     with_ties_(false),
     need_calc_relevance_(true),
+    need_calc_relevance_expr_(true),
     inv_idx_tid_(OB_INVALID_ID),
     fwd_idx_tid_(OB_INVALID_ID),
     doc_id_idx_tid_(OB_INVALID_ID),
@@ -78,6 +79,10 @@ struct ObTextRetrievalInfo
   ObRawExpr *topk_offset_expr_;
   bool with_ties_;
   bool need_calc_relevance_;  // match expr just for retireval (accurate score is not required)
+  // The retrieval scan always projects a relevance column, but its exact value only has to be
+  // computed when some consumer reads the score.  When the match expression is used solely as a
+  // boolean predicate, the executor can emit a placeholder score and skip the BM25 expression.
+  bool need_calc_relevance_expr_;
   uint64_t inv_idx_tid_;  // chosen aux inverted index table id (word-doc)
   uint64_t fwd_idx_tid_;  // chosen aux forward index table id (doc-word)
   uint64_t doc_id_idx_tid_; // chosen aux doc_id index table id (doc-rowkey)

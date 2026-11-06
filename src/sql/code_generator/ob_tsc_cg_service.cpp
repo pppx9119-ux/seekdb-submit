@@ -3045,7 +3045,11 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
     }
   }
 
-  if (OB_SUCC(ret) && tr_info.need_calc_relevance_) {
+  // The exact BM25 score is only generated when a consumer reads it.  Without it the retrieval
+  // scan still projects the relevance column (from the match expression below), and the merge
+  // iterator emits a placeholder score for it, so DaaT merging and the pushdown match filter keep
+  // their current shape.
+  if (OB_SUCC(ret) && tr_info.need_calc_relevance_ && tr_info.need_calc_relevance_expr_) {
     if (OB_ISNULL(tr_info.relevance_expr_)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(cg_.generate_rt_expr(*tr_info.relevance_expr_, text_ir_scan_ctdef.relevance_expr_))) {

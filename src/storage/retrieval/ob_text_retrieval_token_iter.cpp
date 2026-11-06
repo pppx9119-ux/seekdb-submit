@@ -302,10 +302,13 @@ int ObTextRetrievalTokenIter::advance_to(const ObDatum &id_datum)
 int ObTextRetrievalTokenIter::update_scan_param(const ObString &token, common::ObArenaAllocator &allocator)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(inv_idx_agg_param_->key_ranges_.count() != 1)) {
+  // Without the inverted-index aggregate iterator the (token, doc id) range template comes from
+  // the scan parameter itself; with it, the aggregate parameter holds the token-less template.
+  const ObTableScanParam *range_param = need_inv_idx_agg() ? inv_idx_agg_param_ : inv_idx_scan_param_;
+  if (OB_UNLIKELY(range_param->key_ranges_.count() != 1)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    ObNewRange scan_range = inv_idx_agg_param_->key_ranges_.at(0);
+    ObNewRange scan_range = range_param->key_ranges_.at(0);
     ObObj tmp_obj;
     tmp_obj.set_string(ObVarcharType, token);
     tmp_obj.set_meta_type(scan_range.start_key_.get_obj_ptr()->meta_);
@@ -368,33 +371,41 @@ int ObTextRetrievalTokenIter::estimate_token_doc_cnt()
   storage::ObTableScanRange table_scan_range;
   ObSimpleBatch batch;
   batch.type_ = ObSimpleBatch::T_SCAN;
-  batch.range_ = &inv_idx_agg_param_->key_ranges_.at(0);
-  ObTableScanParam est_param;
-  est_param.index_id_ = inv_idx_agg_param_->index_id_;
-  est_param.scan_flag_ = inv_idx_agg_param_->scan_flag_;
-  est_param.tablet_id_ = inv_idx_agg_param_->tablet_id_;
-  est_param.tx_id_ = inv_idx_agg_param_->tx_id_;
-  est_param.schema_version_ = inv_idx_agg_param_->schema_version_;
-  est_param.frozen_version_ = GET_BATCH_ROWS_READ_SNAPSHOT_VERSION;
-  if (OB_ISNULL(access_service = ::oceanbase::share::server_service<::oceanbase::storage::ObAccessService>())) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(table_scan_range.init(*inv_idx_agg_param_, batch, allocator))) {
-  } else if (OB_FAIL(access_service->estimate_row_count(est_param,
-                                                        table_scan_range,
-                                                        timeout_us,
-                                                        est_records,
-                                                        logical_row_cnt,
-                                                        physical_row_cnt))) {
-  } else {
-    token_doc_cnt_ = logical_row_cnt;
+  if (!need_calc_relevance()) {
+    // The token document count only feeds the BM25 token weight; skip the estimation entirely
+    // when the exact score is not required.
     token_doc_cnt_calculated_ = true;
-    sql::ObExpr *total_doc_cnt_param_expr = relevance_expr_->args_[sql::ObExprBM25::TOTAL_DOC_CNT_PARAM_IDX];
-    if (OB_ISNULL(total_doc_cnt_param_expr)) {
+  } else if (OB_UNLIKELY(inv_idx_agg_param_->key_ranges_.count() != 1)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    batch.range_ = &inv_idx_agg_param_->key_ranges_.at(0);
+    ObTableScanParam est_param;
+    est_param.index_id_ = inv_idx_agg_param_->index_id_;
+    est_param.scan_flag_ = inv_idx_agg_param_->scan_flag_;
+    est_param.tablet_id_ = inv_idx_agg_param_->tablet_id_;
+    est_param.tx_id_ = inv_idx_agg_param_->tx_id_;
+    est_param.schema_version_ = inv_idx_agg_param_->schema_version_;
+    est_param.frozen_version_ = GET_BATCH_ROWS_READ_SNAPSHOT_VERSION;
+    if (OB_ISNULL(access_service = ::oceanbase::share::server_service<::oceanbase::storage::ObAccessService>())) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(table_scan_range.init(*inv_idx_agg_param_, batch, allocator))) {
+    } else if (OB_FAIL(access_service->estimate_row_count(est_param,
+                                                          table_scan_range,
+                                                          timeout_us,
+                                                          est_records,
+                                                          logical_row_cnt,
+                                                          physical_row_cnt))) {
     } else {
-      int64_t total_doc_cnt = 0;
-      total_doc_cnt = total_doc_cnt_param_expr->locate_expr_datum(*eval_ctx_, 0).get_int();
-      max_token_relevance_ = sql::ObExprBM25::query_token_weight(token_doc_cnt_, total_doc_cnt);
+      token_doc_cnt_ = logical_row_cnt;
+      token_doc_cnt_calculated_ = true;
+      sql::ObExpr *total_doc_cnt_param_expr = relevance_expr_->args_[sql::ObExprBM25::TOTAL_DOC_CNT_PARAM_IDX];
+      if (OB_ISNULL(total_doc_cnt_param_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        int64_t total_doc_cnt = 0;
+        total_doc_cnt = total_doc_cnt_param_expr->locate_expr_datum(*eval_ctx_, 0).get_int();
+        max_token_relevance_ = sql::ObExprBM25::query_token_weight(token_doc_cnt_, total_doc_cnt);
+      }
     }
   }
   return ret;

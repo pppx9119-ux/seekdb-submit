@@ -12804,6 +12804,55 @@ bool ObTransformUtils::is_full_group_by(ObSelectStmt& stmt, ObSQLMode mode)
   return !stmt.has_order_by() && is_only_full_group_by_on(mode);
 }
 
+int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
+                                                  ObDMLStmt *stmt,
+                                                  ObRawExpr *match_expr,
+                                                  bool &need_calc,
+                                                  ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  need_calc = true;
+  ObMatchFunRawExpr *match_against = NULL;
+  ObSEArray<ObRawExpr *, 8> relation_exprs;
+  if (OB_ISNULL(exec_ctx) || OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(exec_ctx), KP(stmt), KP(match_expr));
+  } else if (OB_UNLIKELY(T_FUN_MATCH_AGAINST != match_expr->get_expr_type())) {
+    // ES_MATCH and the other match flavours keep their own scoring semantics.
+    LOG_DEBUG("not a match against expression, keep the exact score", KPC(match_expr));
+  } else if (OB_FALSE_IT(match_against = static_cast<ObMatchFunRawExpr *>(match_expr))) {
+  } else if (ObMatchAgainstMode::BOOLEAN_MODE == match_against->get_mode_flag()) {
+    // BOOLEAN mode evaluates a boolean expression tree over the per-token scores, so it needs
+    // the exact score of every token.
+  } else if (OB_FAIL(stmt->get_relation_exprs(relation_exprs))) {
+    LOG_WARN("failed to get relation exprs", K(ret));
+  } else {
+    // In NATURAL LANGUAGE and PHRASE mode every candidate document of the token posting union
+    // already satisfies the match predicate, so a match expression used only as a boolean
+    // predicate needs no score.  The same expression may also appear as a value (for example the
+    // ORDER BY MATCH(...) DESC that the preprocess transform adds to fulltext queries), but only
+    // one occurrence - the standalone WHERE predicate - can be discharged by a placeholder score.
+    bool has_match_condition = false;
+    const ObIArray<ObRawExpr *> &conditions = stmt->get_condition_exprs();
+    for (int64_t i = 0; !has_match_condition && i < conditions.count(); ++i) {
+      has_match_condition = (conditions.at(i) == match_expr);
+    }
+    bool need = false;
+    for (int64_t i = 0; OB_SUCC(ret) && !need && i < relation_exprs.count(); ++i) {
+      ObRawExpr *expr = relation_exprs.at(i);
+      if (has_match_condition && expr == match_expr) {
+        has_match_condition = false;
+      } else if (OB_FAIL(inner_check_need_calc_match_score(exec_ctx, expr, match_expr, need, constraints))) {
+        LOG_WARN("failed to check need calc match score", K(ret));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      need_calc = need;
+    }
+  }
+  return ret;
+}
+
 int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
                                                         ObRawExpr* expr, 
                                                         ObRawExpr* match_expr, 
