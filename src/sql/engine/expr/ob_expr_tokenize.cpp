@@ -158,7 +158,7 @@ int ObExprTokenize::cache_tokenize_result(const common::ObString &key,
   } else if (OB_ISNULL(json_result) || key.empty() || need_pack_diff) {
     // Nothing to cache, or the document is a partial update diff rather than
     // a self contained result.
-  } else if (OB_FAIL(ObJsonWrapper::get_raw_binary(json_result, raw_binary, &allocator))) {
+  } else if (OB_FAIL(share::ObJsonWrapper::get_raw_binary(json_result, raw_binary, &allocator))) {
   } else if (OB_FAIL(storage::ObFTTokenizeResultCache::instance().put(key, raw_binary))) {
   }
   return ret;
