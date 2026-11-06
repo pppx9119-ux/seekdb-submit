@@ -221,11 +221,18 @@ jobs:
             --user root \
             --timeout 600
 
-          MYSQL="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -N -s -A --default-character-set=utf8mb4" \
-          MYSQL_VERBOSE="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4" \
-          LABEL=branch \
-          OUTPUT="$GITHUB_WORKSPACE/fts_bench_after.txt" \
-          bash tools/benchmark/fts_large_bench.sh
+          # A single ddl build varies by tens of percent between runs on the same
+          # runner, so the comparison below uses the median of several reports
+          # instead of one sample.  The first run warms the instance and is kept
+          # only to make that warm up identical on both sides.
+          for run in $(seq 1 6); do
+            echo "=== BENCH RUN branch ${run}/6 ==="
+            MYSQL="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -N -s -A --default-character-set=utf8mb4" \
+            MYSQL_VERBOSE="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4" \
+            LABEL=branch \
+            OUTPUT="$GITHUB_WORKSPACE/fts_bench_after.txt" \
+            bash tools/benchmark/fts_large_bench.sh
+          done
 
           # Read-only diagnostics, run after the benchmark so they cannot perturb it.
           set +e
@@ -440,11 +447,14 @@ jobs:
             --user root \
             --timeout 600
 
-          MYSQL="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -N -s -A --default-character-set=utf8mb4" \
-          MYSQL_VERBOSE="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4" \
-          LABEL=baseline \
-          OUTPUT="$GITHUB_WORKSPACE/fts_bench_before.txt" \
-          bash tools/benchmark/fts_large_bench.sh
+          for run in $(seq 1 6); do
+            echo "=== BENCH RUN baseline ${run}/6 ==="
+            MYSQL="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -N -s -A --default-character-set=utf8mb4" \
+            MYSQL_VERBOSE="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4" \
+            LABEL=baseline \
+            OUTPUT="$GITHUB_WORKSPACE/fts_bench_before.txt" \
+            bash tools/benchmark/fts_large_bench.sh
+          done
 
       - name: Score branch report against the official baseline
         if: always()
@@ -461,22 +471,38 @@ jobs:
           import re
           import sys
           from pathlib import Path
+          from statistics import median
 
           metric_re = re.compile(r"^\s*([A-Za-z0-9_]+):\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*$")
 
           def load(path):
               p = Path(path)
               if not p.is_file():
-                  return {}
-              out = {}
+                  return []
+              runs = []
+              current = None
               for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                  if line.strip() == "FTS Large Benchmark Report":
+                      current = {}
+                      runs.append(current)
+                      continue
+                  if current is None:
+                      continue
                   m = metric_re.match(line)
                   if m:
-                      out[m.group(1)] = float(m.group(2))
-              return out
+                      current[m.group(1)] = float(m.group(2))
+              return runs
 
-          before = load(sys.argv[1])
-          after = load(sys.argv[2])
+          def medians(runs):
+              # The first report only warms the instance up, both sides drop it.
+              measured = runs[1:] if len(runs) > 1 else runs
+              out = {}
+              for name in measured[0]:
+                  values = [run[name] for run in measured if name in run]
+                  if values:
+                      out[name] = median(values)
+              return out, len(measured)
+
           groups = {
               "build": ["build_ik_all_sec", "build_ik_content_sec", "build_beng_en_sec"],
               "tokenize": ["tokenize_ik_avg_ms", "tokenize_beng_avg_ms"],
@@ -484,13 +510,18 @@ jobs:
                         "query_mixed_avg_ms", "query_limit_avg_ms"],
           }
 
-          if not before or not after:
+          before_runs = load(sys.argv[1])
+          after_runs = load(sys.argv[2])
+          if not before_runs or not after_runs:
               print("before/after comparison skipped: report missing")
-              print(f"  baseline report: {'present' if before else 'missing'}")
-              print(f"  branch report:   {'present' if after else 'missing'}")
+              print(f"  baseline reports: {len(before_runs)}")
+              print(f"  branch reports:   {len(after_runs)}")
               raise SystemExit(0)
 
-          print("FTS benchmark before/after (same runner)")
+          before, before_n = medians(before_runs)
+          after, after_n = medians(after_runs)
+
+          print(f"FTS benchmark before/after (same runner, median of {after_n} runs)")
           print("========================================")
           category_improvements = []
           for category, metrics in groups.items():
