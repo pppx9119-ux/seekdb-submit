@@ -1972,7 +1972,7 @@ public:
                                             bool check_basic_deterministic,
                                             bool &strict_deterministic);
   static int check_need_calc_match_score(ObExecContext *exec_ctx,
-                                         ObDMLStmt *stmt,
+                                         const ObDMLStmt *stmt,
                                          ObRawExpr *match_expr,
                                          bool &need_calc,
                                          ObIArray<ObExprConstraint> &constraints);

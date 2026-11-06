@@ -12805,7 +12805,7 @@ bool ObTransformUtils::is_full_group_by(ObSelectStmt& stmt, ObSQLMode mode)
 }
 
 int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
-                                                  ObDMLStmt *stmt,
+                                                  const ObDMLStmt *stmt,
                                                   ObRawExpr *match_expr,
                                                   bool &need_calc,
                                                   ObIArray<ObExprConstraint> &constraints)
@@ -12858,7 +12858,7 @@ int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
     if (OB_SUCC(ret) && !needs_score && OB_FAIL(stmt->get_order_exprs(order_exprs))) {
       LOG_WARN("failed to get order exprs", K(ret));
     } else if (OB_SUCC(ret) && !needs_score && stmt->is_select_stmt()) {
-      ObSelectStmt *select_stmt = static_cast<ObSelectStmt *>(stmt);
+      const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(stmt);
       ObSEArray<ObRawExpr *, 8> select_exprs;
       if (OB_FAIL(select_stmt->get_select_exprs(select_exprs))) {
         LOG_WARN("failed to get select exprs", K(ret));

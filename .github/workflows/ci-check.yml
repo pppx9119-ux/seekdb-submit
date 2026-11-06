@@ -227,6 +227,38 @@ jobs:
           OUTPUT="$GITHUB_WORKSPACE/fts_bench_after.txt" \
           bash tools/benchmark/fts_large_bench.sh
 
+          # Read-only diagnostics, run after the benchmark so they cannot perturb it.
+          set +e
+          CLIENT="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4"
+          diag() { $CLIENT -e "SET NAMES utf8mb4; $1" 2>&1 | sed 's/^/  /'; }
+          echo "=== DIAG explain query_cn ==="
+          diag "EXPLAIN SELECT COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('全文索引 分词器');"
+          echo "=== DIAG explain query_limit ==="
+          diag "EXPLAIN SELECT COUNT(*) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20) t;"
+          echo "=== DIAG limit early-stop experiment ==="
+          for n in 20 20000; do
+            : > /tmp/diag_limit.sql
+            echo "SET NAMES utf8mb4;" >> /tmp/diag_limit.sql
+            for i in $(seq 1 50); do
+              echo "SELECT COUNT(*) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT $n) t;" >> /tmp/diag_limit.sql
+            done
+            start_ns=$(date +%s%N)
+            $CLIENT -N -s < /tmp/diag_limit.sql > /dev/null 2>&1
+            end_ns=$(date +%s%N)
+            echo "  limit=$n total_50_ms=$(( (end_ns - start_ns) / 1000000 ))"
+          done
+
+          echo "=== DIAG tokenize-in-scan comparison (20000 distinct documents) ==="
+          for p in ik space beng; do
+            for col in content title; do
+              start_ns=$(date +%s%N)
+              $CLIENT -N -s -e "SET NAMES utf8mb4; SELECT COUNT(tokenize($col, '$p')) FROM fts_large_bench.docs;" > /dev/null 2>&1
+              end_ns=$(date +%s%N)
+              echo "  parser=$p col=$col total_ms=$(( (end_ns - start_ns) / 1000000 ))"
+            done
+          done
+          echo "=== DIAG end ==="
+
       - name: Collect seekdb logs on failure
         if: failure()
         run: |
