@@ -16,6 +16,7 @@
 
 #include "config_bridge.h"
 #include "lib/container/ob_se_array.h"
+#include "lib/utility/ob_time_utility.h"
 #include "common/json_type/ob_json_bin.h"
 #include "share/ob_errno.h"
 #define USING_LOG_PREFIX SQL_DAS
@@ -35,6 +36,11 @@ namespace oceanbase
 namespace sql
 {
 using storage::ObFTWordMap;
+
+// Temporary build profile: per document cost of turning one text value into
+// the word rows of the aux table (segment plus row construction).
+static thread_local int64_t g_fts_row_profile_docs = 0;
+static thread_local int64_t g_fts_row_profile_us = 0;
 
 
 ObObjDatumMapType ObFTIndexRowCache::FTS_INDEX_TYPES[] = {OBJ_DATUM_STRING, OBJ_DATUM_STRING, OBJ_DATUM_8BYTE_DATA, OBJ_DATUM_8BYTE_DATA};
@@ -85,6 +91,7 @@ int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
                                const ObString &fulltext)
 {
   int ret = OB_SUCCESS;
+  const int64_t profile_begin = ObTimeUtility::fast_current_time();
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
   } else if (FALSE_IT(reuse())) {
@@ -97,6 +104,11 @@ int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
                                                                    rows_))) {
   } else {
     row_idx_ = 0;
+    g_fts_row_profile_us += ObTimeUtility::fast_current_time() - profile_begin;
+    ++g_fts_row_profile_docs;
+    if (0 == g_fts_row_profile_docs % 4096) {
+      LOG_WARN("FTS_ROW_PROFILE", K(g_fts_row_profile_docs), K(g_fts_row_profile_us));
+    }
   }
   LOG_TRACE("word segment", K(ret), K(row_idx_), K(rows_.count()), K(doc_id_datum), K(fulltext));
   return ret;

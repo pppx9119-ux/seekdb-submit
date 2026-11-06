@@ -313,6 +313,11 @@ jobs:
             grep -a "index sstable build task send innersql" "$OLOG" | tail -16 | cut -c1-130
           fi
 
+          echo "=== DIAG fts segment profile ==="
+          for f in $(find "$INSTANCE" -name 'observer.log*' 2>/dev/null); do
+            grep -a 'FTS_SEG_PROFILE\|FTS_ROW_PROFILE\|FTS_IK_PROFILE' "$f" | tail -24 | cut -c1-220
+          done
+
           echo "=== DIAG ddl word scaling (LEFT(content, N)) ==="
           for n in 0 40 80 160; do
             $CLIENT -e "SET NAMES utf8mb4; DROP TABLE IF EXISTS fts_large_bench.docs_len$n; CREATE TABLE fts_large_bench.docs_len$n (id BIGINT AUTO_INCREMENT PRIMARY KEY, content TEXT NOT NULL) DEFAULT CHARSET = utf8mb4; INSERT INTO fts_large_bench.docs_len$n (content) SELECT LEFT(content, $n) FROM fts_large_bench.docs;" >/dev/null 2>&1

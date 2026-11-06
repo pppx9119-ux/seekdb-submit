@@ -31,12 +31,21 @@
 #include "storage/fts/ob_fts_stop_word.h"
 #include "lib/hash_func/murmur_hash.h"
 #include "lib/lock/ob_mutex.h"
+#include "lib/utility/ob_time_utility.h"
 #include "storage/fts/ob_whitespace_ft_parser.h"
 
 namespace oceanbase
 {
 namespace storage
 {
+
+// Temporary build profile: split the per document cost between the parser setup
+// (parser construction, dictionary lookup, context allocation) and the token
+// loop (segmentation plus the caller's word grouping).
+static thread_local int64_t g_fts_seg_profile_docs = 0;
+static thread_local int64_t g_fts_seg_profile_setup_us = 0;
+static thread_local int64_t g_fts_seg_profile_iter_us = 0;
+static thread_local int64_t g_fts_seg_profile_words = 0;
 
 const char *ObFTParser::NAME_STR[ObFTParser::ParserType::FTP_MAX] = {
 #define FT_PARSER_TYPE(ftp_type, parser_name) #parser_name,
@@ -284,10 +293,12 @@ int ObFTParseHelper::segment(
     param.min_ngram_size_ = property.min_ngram_token_size_;
     param.max_ngram_size_ = property.max_ngram_token_size_;
 
+    const int64_t profile_begin = ObTimeUtility::fast_current_time();
     if (OB_FAIL(parser_desc->segment(&param, iter))) {
     } else if (OB_ISNULL(iter)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
+      const int64_t profile_setup = ObTimeUtility::fast_current_time();
       const char *word = nullptr;
       int64_t word_len = 0;
       int64_t char_cnt = 0;
@@ -299,6 +310,8 @@ int ObFTParseHelper::segment(
         } else if (OB_FAIL(add_word.process_word(word, word_len, char_cnt, word_freq))) {
         }
       }
+      g_fts_seg_profile_setup_us += profile_setup - profile_begin;
+      g_fts_seg_profile_iter_us += ObTimeUtility::fast_current_time() - profile_setup;
       if (OB_ITER_END == ret) {
         ret = OB_SUCCESS;
       }
@@ -392,6 +405,12 @@ int ObFTParseHelper::segment(
                     add_word))) {
     } else {
       doc_length = add_word.get_add_word_count();
+      ++g_fts_seg_profile_docs;
+      g_fts_seg_profile_words += words.size();
+      if (0 == g_fts_seg_profile_docs % 4096) {
+        LOG_WARN("FTS_SEG_PROFILE", K(g_fts_seg_profile_docs), K(g_fts_seg_profile_setup_us),
+            K(g_fts_seg_profile_iter_us), K(g_fts_seg_profile_words));
+      }
     }
   }
   LOG_DEBUG("ft parse segment", K(ret), K(type), K(add_word_flag_), K(parser_name_),
