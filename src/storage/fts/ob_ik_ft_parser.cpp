@@ -22,7 +22,7 @@
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_macro_utils.h"
-#include "lib/utility/ob_time_utility.h"
+#include "lib/time/ob_time_utility.h"
 #include "lib/utility/utility.h"
 #include "data_plane/fts/ob_fts_struct.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
@@ -60,16 +60,16 @@ int ObIKFTParser::init(const ObFTParserParam &param)
     } else if (CS_TYPE_INVALID == (coll_type_ = ObCharset::collation_type(param.cs_->name))) {
       ret = OB_INVALID_ARGUMENT;
     } else {
-      const int64_t profile_begin = ObTimeUtility::fast_current_time();
+      const int64_t profile_begin = common::ObTimeUtility::fast_current_time();
       if (OB_FAIL(init_dict(param))) {
       } else {
-        const int64_t profile_dict = ObTimeUtility::fast_current_time();
+        const int64_t profile_dict = common::ObTimeUtility::fast_current_time();
         if (OB_FAIL(init_ctx(param))) {
         } else {
-          const int64_t profile_ctx = ObTimeUtility::fast_current_time();
+          const int64_t profile_ctx = common::ObTimeUtility::fast_current_time();
           if (OB_FAIL(init_segmenter(param))) {
           } else {
-            const int64_t profile_end = ObTimeUtility::fast_current_time();
+            const int64_t profile_end = common::ObTimeUtility::fast_current_time();
             g_fts_ik_profile_dict_us += profile_dict - profile_begin;
             g_fts_ik_profile_ctx_us += profile_ctx - profile_dict;
             g_fts_ik_profile_segmenter_us += profile_end - profile_ctx;

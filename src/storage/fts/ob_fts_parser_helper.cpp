@@ -31,7 +31,7 @@
 #include "storage/fts/ob_fts_stop_word.h"
 #include "lib/hash_func/murmur_hash.h"
 #include "lib/lock/ob_mutex.h"
-#include "lib/utility/ob_time_utility.h"
+#include "lib/time/ob_time_utility.h"
 #include "storage/fts/ob_whitespace_ft_parser.h"
 
 namespace oceanbase
@@ -293,12 +293,12 @@ int ObFTParseHelper::segment(
     param.min_ngram_size_ = property.min_ngram_token_size_;
     param.max_ngram_size_ = property.max_ngram_token_size_;
 
-    const int64_t profile_begin = ObTimeUtility::fast_current_time();
+    const int64_t profile_begin = common::ObTimeUtility::fast_current_time();
     if (OB_FAIL(parser_desc->segment(&param, iter))) {
     } else if (OB_ISNULL(iter)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
-      const int64_t profile_setup = ObTimeUtility::fast_current_time();
+      const int64_t profile_setup = common::ObTimeUtility::fast_current_time();
       const char *word = nullptr;
       int64_t word_len = 0;
       int64_t char_cnt = 0;
@@ -311,7 +311,7 @@ int ObFTParseHelper::segment(
         }
       }
       g_fts_seg_profile_setup_us += profile_setup - profile_begin;
-      g_fts_seg_profile_iter_us += ObTimeUtility::fast_current_time() - profile_setup;
+      g_fts_seg_profile_iter_us += common::ObTimeUtility::fast_current_time() - profile_setup;
       if (OB_ITER_END == ret) {
         ret = OB_SUCCESS;
       }

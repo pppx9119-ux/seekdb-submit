@@ -16,7 +16,7 @@
 
 #include "config_bridge.h"
 #include "lib/container/ob_se_array.h"
-#include "lib/utility/ob_time_utility.h"
+#include "lib/time/ob_time_utility.h"
 #include "common/json_type/ob_json_bin.h"
 #include "share/ob_errno.h"
 #define USING_LOG_PREFIX SQL_DAS

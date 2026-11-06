@@ -314,9 +314,11 @@ jobs:
           fi
 
           echo "=== DIAG fts segment profile ==="
-          for f in $(find "$INSTANCE" -name 'observer.log*' 2>/dev/null); do
-            grep -a 'FTS_SEG_PROFILE\|FTS_ROW_PROFILE\|FTS_IK_PROFILE' "$f" | tail -24 | cut -c1-220
-          done
+          PROF=$(find "$INSTANCE" -name 'observer.log*' 2>/dev/null | xargs -r grep -ah 'FTS_SEG_PROFILE\|FTS_ROW_PROFILE\|FTS_IK_PROFILE' | sort)
+          echo "  profile_lines=$(printf '%s\n' "$PROF" | grep -c .)"
+          printf '%s\n' "$PROF" | head -72 | cut -c1-210
+          echo "  --- profile tail ---"
+          printf '%s\n' "$PROF" | tail -12 | cut -c1-210
 
           echo "=== DIAG ddl word scaling (LEFT(content, N)) ==="
           for n in 0 40 80 160; do
