@@ -252,11 +252,46 @@ jobs:
           for p in ik space beng; do
             for col in content title; do
               start_ns=$(date +%s%N)
-              $CLIENT -N -s -e "SET NAMES utf8mb4; SELECT COUNT(tokenize($col, '$p')) FROM fts_large_bench.docs;" > /dev/null 2>&1
+              out=$($CLIENT -N -s -e "SET NAMES utf8mb4; SELECT COUNT(tokenize($col, '$p')) FROM fts_large_bench.docs;" 2>&1)
               end_ns=$(date +%s%N)
-              echo "  parser=$p col=$col total_ms=$(( (end_ns - start_ns) / 1000000 ))"
+              echo "  parser=$p col=$col total_ms=$(( (end_ns - start_ns) / 1000000 )) result=$(echo "$out" | tail -1)"
             done
           done
+
+          echo "=== DIAG tokenize statement cost (2000 statements in one session) ==="
+          IK_TXT='OceanBase是一款非常稳定的数据库，全文索引的分词器热路径优化包括解析器实例复用、停用词全局单例、内存池化数据结构等技术，在大量文档索引和查询场景下可以显著降低 CPU 开销。'
+          : > /tmp/diag_select1.sql
+          : > /tmp/diag_hit.sql
+          : > /tmp/diag_miss.sql
+          for f in /tmp/diag_select1.sql /tmp/diag_hit.sql /tmp/diag_miss.sql; do echo "SET NAMES utf8mb4;" >> "$f"; done
+          for i in $(seq 1 2000); do
+            echo "SELECT 1;" >> /tmp/diag_select1.sql
+            echo "SELECT tokenize('$IK_TXT','ik');" >> /tmp/diag_hit.sql
+            echo "SELECT tokenize('$IK_TXT $i','ik');" >> /tmp/diag_miss.sql
+          done
+          for name in select1 hit miss; do
+            start_ns=$(date +%s%N)
+            $CLIENT -N -s < "/tmp/diag_${name}.sql" > /dev/null 2>&1
+            end_ns=$(date +%s%N)
+            echo "  tokenize_${name} total_2000_ms=$(( (end_ns - start_ns) / 1000000 ))"
+          done
+
+          echo "=== DIAG ddl costs (runner_cores=$(nproc)) ==="
+          time_ddl() {
+            name=$1
+            sql=$2
+            start_ns=$(date +%s%N)
+            out=$($CLIENT -e "SET NAMES utf8mb4; $sql" 2>&1)
+            end_ns=$(date +%s%N)
+            echo "  $name total_ms=$(( (end_ns - start_ns) / 1000000 )) msg=$(echo "$out" | head -2 | tr '\n' ';')"
+          }
+          time_ddl add_stored_column "ALTER TABLE fts_large_bench.docs ADD COLUMN diag_col_1 INT DEFAULT 0;"
+          time_ddl add_virtual_column "ALTER TABLE fts_large_bench.docs ADD COLUMN diag_vcol_1 INT GENERATED ALWAYS AS (id + 1) VIRTUAL;"
+          time_ddl fts_ik_content_par6 "SET _force_parallel_ddl_dop=6; ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_p6(content) WITH PARSER ik;"
+          time_ddl fts_ik_content_serial1 "ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_s1(content) WITH PARSER ik;"
+          time_ddl fts_ik_title_serial1 "ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_ts1(title) WITH PARSER ik;"
+          time_ddl fts_ik_title_par6 "SET _force_parallel_ddl_dop=6; ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_tp6(title) WITH PARSER ik;"
+          time_ddl fts_ik_content_serial2 "ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_s2(content) WITH PARSER ik;"
           echo "=== DIAG end ==="
 
       - name: Collect seekdb logs on failure
