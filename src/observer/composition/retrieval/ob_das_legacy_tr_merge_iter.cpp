@@ -380,7 +380,14 @@ int ObDASLegacyTRMergeIter::create_sparse_retrieval_iter()
   sr_iter_param_.id_proj_expr_ = ir_ctdef_->inv_scan_domain_id_col_;
   sr_iter_param_.relevance_expr_ = ir_ctdef_->relevance_expr_;
   sr_iter_param_.relevance_proj_expr_ = ir_ctdef_->relevance_proj_col_;
-  sr_iter_param_.filter_expr_ = ir_ctdef_->match_filter_;
+  // In natural language mode the retrieval merge emits exactly the documents that contain at
+  // least one query token, which is what the pushed-down match predicate checks.  When nothing
+  // reads the exact score, re-evaluating that predicate on every emitted row can never reject
+  // one of them, so the per-row evaluation is skipped.  Other modes (boolean, phrase, query
+  // expansion) keep the predicate because their emitted set is not the natural-language union.
+  const bool need_match_filter = ir_ctdef_->need_calc_relevance()
+      || NATURAL_LANGUAGE_MODE != ir_ctdef_->mode_flag_;
+  sr_iter_param_.filter_expr_ = need_match_filter ? ir_ctdef_->match_filter_ : nullptr;
   sr_iter_param_.topk_limit_ = topk_limit_;
   if (OB_NOT_NULL(ir_ctdef_->field_boost_expr_)) {
     ObDatum *boost_datum = nullptr;

@@ -39,7 +39,7 @@ permissions:
 
 concurrency:
   group: seekdb-fts-perf-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CCACHE_DIR: ${{ github.workspace }}/.ccache
