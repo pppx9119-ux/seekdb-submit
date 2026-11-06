@@ -1151,7 +1151,9 @@ int ObDASTRTaatIter::fill_chunk_store_by_tr_iter()
   } else {
     ObSEArray<ObExpr *, 2> exprs;
     if (OB_FAIL(exprs.push_back(ir_ctdef_->inv_scan_domain_id_col_))) {
-    } else if (ir_ctdef_->need_proj_relevance_score()) {
+    } else if (ir_ctdef_->need_calc_relevance()) {
+      // The store holds a relevance column only when the scan computes a score; otherwise the
+      // hash map records a constant positive placeholder for every document.
       if (OB_FAIL(exprs.push_back(ir_ctdef_->relevance_expr_))) {
       }
     }
@@ -1316,7 +1318,9 @@ int ObDASTRTaatIter::load_next_hashmap()
 int ObDASTRTaatIter::inner_load_next_hashmap()
 {
   int ret = OB_SUCCESS;
-  const bool need_relevance = ir_ctdef_->need_proj_relevance_score();
+  // Must match fill_chunk_store_by_tr_iter: the stored rows carry a relevance column only when
+  // the scan computes a score.
+  const bool need_relevance = ir_ctdef_->need_calc_relevance();
   if (OB_UNLIKELY(hash_maps_[cur_map_idx_]->size() != 0)) {
     ret = OB_ERR_UNEXPECTED;
   }

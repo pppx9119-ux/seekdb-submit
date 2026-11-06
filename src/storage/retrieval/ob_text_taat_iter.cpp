@@ -63,7 +63,11 @@ void ObTextTaaTIter::reuse(const bool switch_tablet)
 int ObTextTaaTIter::pre_process()
 {
   int ret = OB_SUCCESS;
-  if (iter_param_->need_project_relevance()) {
+  if (!iter_param_->need_calc_relevance()) {
+    // The hash map only deduplicates document ids here, so a single partition is enough and no
+    // BM25 statistics are needed.
+    partition_cnt_ = 1;
+  } else if (iter_param_->need_project_relevance()) {
     const bool is_first_estimation = !bm25_param_estimator_.is_estimated();
     if (!is_first_estimation) {
       // skip

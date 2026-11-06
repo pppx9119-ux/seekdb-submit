@@ -115,7 +115,10 @@ struct ObSparseRetrievalMergeParam
       max_batch_size_(1)
   {}
   ~ObSparseRetrievalMergeParam() {}
+  // The projected relevance column may exist while the score itself is unused by the plan, in
+  // which case there is no relevance expression to evaluate and no BM25 statistics to prepare.
   bool need_project_relevance() const { return relevance_proj_expr_ != nullptr; }
+  bool need_calc_relevance() const { return relevance_expr_ != nullptr; }
   bool need_filter() const { return filter_expr_ != nullptr; }
   bool need_pushdown_topk() const { return topk_limit_ > 0; }
   TO_STRING_KV(KPC_(dim_weights), KPC(limit_param_), KP_(eval_ctx),

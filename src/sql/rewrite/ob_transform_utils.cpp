@@ -12813,41 +12813,162 @@ int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
   int ret = OB_SUCCESS;
   need_calc = true;
   ObMatchFunRawExpr *match_against = NULL;
-  ObSEArray<ObRawExpr *, 8> relation_exprs;
   if (OB_ISNULL(exec_ctx) || OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), KP(exec_ctx), KP(stmt), KP(match_expr));
   } else if (OB_UNLIKELY(T_FUN_MATCH_AGAINST != match_expr->get_expr_type())) {
     // ES_MATCH and the other match flavours keep their own scoring semantics.
-    LOG_DEBUG("not a match against expression, keep the exact score", KPC(match_expr));
+    LOG_DEBUG("not a match against expression, keep the exact score", KP(match_expr));
   } else if (OB_FALSE_IT(match_against = static_cast<ObMatchFunRawExpr *>(match_expr))) {
   } else if (ObMatchAgainstMode::BOOLEAN_MODE == match_against->get_mode_flag()) {
     // BOOLEAN mode evaluates a boolean expression tree over the per-token scores, so it needs
     // the exact score of every token.
-  } else if (OB_FAIL(stmt->get_relation_exprs(relation_exprs))) {
-    LOG_WARN("failed to get relation exprs", K(ret));
+  } else if (OB_UNLIKELY(!stmt->is_select_stmt())) {
+    // Only a SELECT exposes every consumer of the match value through the expression roots walked
+    // below; a DML statement keeps the exact score.
   } else {
     // In NATURAL LANGUAGE and PHRASE mode every candidate document of the token posting union
-    // already satisfies the match predicate, so a match expression used only as a boolean
-    // predicate needs no score.  The same expression may also appear as a value (for example the
-    // ORDER BY MATCH(...) DESC that the preprocess transform adds to fulltext queries), but only
-    // one occurrence - the standalone WHERE predicate - can be discharged by a placeholder score.
-    bool has_match_condition = false;
+    // already satisfies the match predicate, so a match expression used only as the standalone
+    // WHERE predicate needs no score.  Every other consumer - the select list, ORDER BY, GROUP BY,
+    // HAVING or a nested expression such as "match > 0.7" - reads the value itself and keeps the
+    // exact score.  The analysis walks the statement's expression roots, because the flattened
+    // relation expressions cannot tell a predicate use from a value use.
+    bool saw_match = false;
+    bool needs_score = false;
     const ObIArray<ObRawExpr *> &conditions = stmt->get_condition_exprs();
-    for (int64_t i = 0; !has_match_condition && i < conditions.count(); ++i) {
-      has_match_condition = (conditions.at(i) == match_expr);
-    }
-    bool need = false;
-    for (int64_t i = 0; OB_SUCC(ret) && !need && i < relation_exprs.count(); ++i) {
-      ObRawExpr *expr = relation_exprs.at(i);
-      if (has_match_condition && expr == match_expr) {
-        has_match_condition = false;
-      } else if (OB_FAIL(inner_check_need_calc_match_score(exec_ctx, expr, match_expr, need, constraints))) {
-        LOG_WARN("failed to check need calc match score", K(ret));
+    for (int64_t i = 0; OB_SUCC(ret) && !needs_score && i < conditions.count(); ++i) {
+      bool contains = false;
+      bool needs = false;
+      if (OB_FAIL(SMART_CALL(check_match_usage(exec_ctx,
+                                               conditions.at(i),
+                                               match_expr,
+                                               true, /* predicate position */
+                                               contains,
+                                               needs,
+                                               constraints)))) {
+        LOG_WARN("failed to check match usage", K(ret));
+      } else {
+        saw_match |= contains;
+        needs_score |= needs;
       }
     }
+
+    ObSEArray<ObRawExpr *, 16> value_exprs;
+    ObSEArray<ObRawExpr *, 8> order_exprs;
+    if (OB_SUCC(ret) && !needs_score && OB_FAIL(stmt->get_order_exprs(order_exprs))) {
+      LOG_WARN("failed to get order exprs", K(ret));
+    } else if (OB_SUCC(ret) && !needs_score && stmt->is_select_stmt()) {
+      ObSelectStmt *select_stmt = static_cast<ObSelectStmt *>(stmt);
+      ObSEArray<ObRawExpr *, 8> select_exprs;
+      if (OB_FAIL(select_stmt->get_select_exprs(select_exprs))) {
+        LOG_WARN("failed to get select exprs", K(ret));
+      }
+      const ObIArray<ObRawExpr *> &group_exprs = select_stmt->get_group_exprs();
+      const ObIArray<ObRawExpr *> &rollup_exprs = select_stmt->get_rollup_exprs();
+      const ObIArray<ObRawExpr *> &having_exprs = select_stmt->get_having_exprs();
+      for (int64_t i = 0; OB_SUCC(ret) && i < select_exprs.count(); ++i) {
+        ret = value_exprs.push_back(select_exprs.at(i));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < order_exprs.count(); ++i) {
+        ret = value_exprs.push_back(order_exprs.at(i));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < group_exprs.count(); ++i) {
+        ret = value_exprs.push_back(group_exprs.at(i));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < rollup_exprs.count(); ++i) {
+        ret = value_exprs.push_back(rollup_exprs.at(i));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < having_exprs.count(); ++i) {
+        ret = value_exprs.push_back(having_exprs.at(i));
+      }
+    }
+
+    for (int64_t i = 0; OB_SUCC(ret) && !needs_score && i < value_exprs.count(); ++i) {
+      bool contains = false;
+      bool needs = false;
+      if (OB_FAIL(SMART_CALL(check_match_usage(exec_ctx,
+                                               value_exprs.at(i),
+                                               match_expr,
+                                               false, /* value position */
+                                               contains,
+                                               needs,
+                                               constraints)))) {
+        LOG_WARN("failed to check match usage", K(ret));
+      } else {
+        saw_match |= contains;
+        needs_score |= needs;
+      }
+    }
+
     if (OB_SUCC(ret)) {
-      need_calc = need;
+      // Disable the score only when every use of the match expression is the standalone
+      // predicate; an unlocated use (for example in a join condition) keeps it.
+      need_calc = needs_score || !saw_match;
+    }
+  }
+  return ret;
+}
+
+int ObTransformUtils::check_match_usage(ObExecContext *exec_ctx,
+                                        ObRawExpr *expr,
+                                        ObRawExpr *match_expr,
+                                        const bool allow_discharge,
+                                        bool &contains,
+                                        bool &needs_score,
+                                        ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  contains = false;
+  needs_score = false;
+  if (OB_ISNULL(expr) || OB_ISNULL(match_expr)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(expr), KP(match_expr));
+  } else if (expr == match_expr) {
+    contains = true;
+    // In predicate position the bare match is satisfied by every candidate of the posting union;
+    // in value position its result is read.
+    needs_score = !allow_discharge;
+  } else if (allow_discharge && T_OP_BOOL == expr->get_expr_type() &&
+             1 == expr->get_param_count() && match_expr == expr->get_param_expr(0)) {
+    // The resolver wraps a bare `WHERE MATCH(...) AGAINST(...)` in T_OP_BOOL.  Every candidate
+    // document of the posting union satisfies it, and the retrieval scan skips the pushdown match
+    // filter when it does not compute a score, so the predicate needs no value.
+    contains = true;
+  } else if (allow_discharge && 2 == expr->get_param_count() &&
+             (T_OP_GT == expr->get_expr_type() || T_OP_LT == expr->get_expr_type()) &&
+             (match_expr == expr->get_param_expr(0) || match_expr == expr->get_param_expr(1))) {
+    // `match > 0` and `0 < match` select the same documents as the bare predicate; every other
+    // comparison, including `match > 0.7`, reads the value itself.
+    const bool match_left = (match_expr == expr->get_param_expr(0));
+    const bool is_greater = (T_OP_GT == expr->get_expr_type());
+    ObRawExpr *bound = expr->get_param_expr(match_left ? 1 : 0);
+    bool is_zero = false;
+    contains = true;
+    if (match_left != is_greater) {
+      needs_score = true;
+    } else if (OB_FAIL(check_expr_eq_zero(exec_ctx, bound, is_zero, constraints))) {
+      LOG_WARN("failed to check expr eq zero", K(ret));
+    } else {
+      needs_score = !is_zero;
+    }
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < expr->get_param_count(); ++i) {
+      bool child_contains = false;
+      bool child_needs_score = false;
+      // An AND keeps its conjuncts in predicate position; any other operator consumes the value.
+      const bool child_discharge = allow_discharge && T_OP_AND == expr->get_expr_type();
+      if (OB_FAIL(SMART_CALL(check_match_usage(exec_ctx,
+                                               expr->get_param_expr(i),
+                                               match_expr,
+                                               child_discharge,
+                                               child_contains,
+                                               child_needs_score,
+                                               constraints)))) {
+        LOG_WARN("failed to check match usage", K(ret));
+      } else {
+        contains |= child_contains;
+        needs_score |= child_needs_score;
+      }
     }
   }
   return ret;
