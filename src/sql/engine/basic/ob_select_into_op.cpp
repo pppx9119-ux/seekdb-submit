@@ -17,7 +17,6 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include <cmath>
-#include <cstdio>
 #include <memory>
 
 #include "ob_select_into_op.h"
@@ -37,8 +36,8 @@ namespace sql
 
 OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
-    field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, select_names_, is_single_,
-    max_file_size_, escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
+    field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
+    escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
     external_properties_);
 
 
@@ -201,9 +200,6 @@ int ObSelectIntoOp::inner_get_next_row()
       && T_INTO_VARIABLES != into_type
       && OB_FAIL(create_the_only_data_writer(data_writer))) {
   }
-  if (OB_SUCC(ret) && T_INTO_OUTFILE == into_type && OB_NOT_NULL(data_writer)
-      && OB_FAIL(write_csv_header(*static_cast<ObCsvFileWriter *>(data_writer)))) {
-  }
   while (OB_SUCC(ret) && row_count < top_limit_cnt_) {
     clear_evaluated_flag();
     if (OB_FAIL(child_->get_next_row())) {
@@ -257,8 +253,6 @@ int ObSelectIntoOp::inner_get_next_batch(const int64_t max_row_cnt)
     if (OB_FAIL(create_the_only_data_writer(data_writer))) {
     } else if (OB_ISNULL(data_writer)) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (T_INTO_OUTFILE == into_type
-               && OB_FAIL(write_csv_header(*static_cast<ObCsvFileWriter *>(data_writer)))) {
     }
   }
 
@@ -331,32 +325,9 @@ int ObSelectIntoOp::inner_rescan()
 int ObSelectIntoOp::inner_close()
 {
   int ret = OB_SUCCESS;
-  const int errcode = ctx_.get_errcode();
-  if (OB_NOT_NULL(data_writer_)) {
-    if (OB_SUCCESS != errcode && T_INTO_OUTFILE == MY_SPEC.into_type_) {
-      // The statement failed while it was writing the outfile. Drop the file
-      // this statement created so a half-written export is never observable,
-      // but never touch a file that was already there (open failed) or is
-      // owned by another statement.
-      const bool created = data_writer_->is_file_opened_;
-      data_writer_->close_file();
-      if (created) {
-        remove_outfile();
-      }
-    } else if (OB_FAIL(data_writer_->close_data_writer())) {
-    }
+  if (OB_NOT_NULL(data_writer_) && OB_FAIL(data_writer_->close_data_writer())) {
   }
   return ret;
-}
-
-void ObSelectIntoOp::remove_outfile()
-{
-  if (!basic_url_.empty() && basic_url_.length() <= PATH_MAX) {
-    char path[PATH_MAX + 1];
-    MEMCPY(path, basic_url_.ptr(), basic_url_.length());
-    path[basic_url_.length()] = '\0';
-    ::remove(path);
-  }
 }
 
 int ObSelectIntoOp::get_row_str(const int64_t buf_len,
@@ -950,78 +921,24 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
 {
   int ret = OB_SUCCESS;
   char char_n = 'N';
-  // A text value that is empty or spells the NULL marker must be enclosed:
-  // otherwise reading the file back turns it into a NULL, losing data.
-  bool force_enclose = false;
-  if (has_enclose_ && !obj.is_null() && obj.is_string_type()) {
-    const ObString str = obj.get_varchar();
-    if (str.empty()) {
-      force_enclose = true;
-    } else if (!MY_SPEC.external_properties_.str_.empty()
-               && external_properties_.csv_format_.null_if_.count() > 0
-               && str == external_properties_.csv_format_.null_if_.at(0)) {
-      force_enclose = true;
-    }
-  }
-  const bool need_enclose = force_enclose
-                            || (has_enclose_ && !obj.is_null()
-                                && (!is_optional_ || obj.is_string_type() || obj.is_collection_sql_type()
-                                    || obj.is_json() || obj.is_geometry() || obj.is_date()
-                                    || obj.is_time() || obj.is_timestamp() || obj.is_datetime()
-                                    || obj.is_mysql_date() || obj.is_mysql_datetime()));
+  const bool need_enclose = has_enclose_ && !obj.is_null()
+                            && (!is_optional_ || obj.is_string_type() || obj.is_collection_sql_type()
+                                || obj.is_json() || obj.is_geometry() || obj.is_date()
+                                || obj.is_time() || obj.is_timestamp() || obj.is_datetime()
+                                || obj.is_mysql_date() || obj.is_mysql_datetime());
   if (need_enclose) {
     OZ(write_single_char_to_file(&char_enclose_, data_writer));
   }
   if (!has_escape_) {
     OZ(write_obj_to_file(obj, data_writer, false));
   } else if (obj.is_null()) {
-    if (!MY_SPEC.external_properties_.str_.empty()
-        && external_properties_.csv_format_.null_if_.count() > 0) {
-      // A NULL text option was requested (COPY ... NULLSTR). Write it verbatim,
-      // including the empty string, so the file reads back with the same NULLs.
-      const ObString &null_str = external_properties_.csv_format_.null_if_.at(0);
-      if (!null_str.empty()) {
-        ObObj null_obj;
-        null_obj.set_varchar(null_str);
-        null_obj.set_collation_type(cs_type_);
-        OZ(write_obj_to_file(null_obj, data_writer, false));
-      }
-    } else {
-      OZ(write_single_char_to_file(&char_escape_, data_writer));
-      OZ(write_single_char_to_file(&char_n, data_writer));
-    }
+    OZ(write_single_char_to_file(&char_escape_, data_writer));
+    OZ(write_single_char_to_file(&char_n, data_writer));
   } else {
     OZ(write_obj_to_file(obj, data_writer, true));
   }
   if (need_enclose) {
     OZ(write_single_char_to_file(&char_enclose_, data_writer));
-  }
-  return ret;
-}
-
-int ObSelectIntoOp::write_csv_header(ObCsvFileWriter &data_writer)
-{
-  int ret = OB_SUCCESS;
-  if (!header_written_) {
-    header_written_ = true;
-    if (external_properties_.csv_format_.parse_header_
-        && MY_SPEC.select_names_.count() > 0
-        && MY_SPEC.select_names_.count() == MY_SPEC.select_exprs_.count()) {
-      for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.select_names_.count(); ++i) {
-        ObObj obj;
-        obj.set_varchar(MY_SPEC.select_names_.at(i));
-        obj.set_collation_type(cs_type_);
-        OZ(print_field(obj, data_writer));
-        if (OB_SUCC(ret) && i != MY_SPEC.select_names_.count() - 1) {
-          OZ(write_obj_to_file(field_str_, data_writer));
-        }
-      }
-      OZ(write_obj_to_file(line_str_, data_writer));
-      OZ(data_writer.flush_shared_buf(shared_buf_));
-      if (has_compress_) {
-        OZ(data_writer.flush_buf());
-      }
-    }
   }
   return ret;
 }

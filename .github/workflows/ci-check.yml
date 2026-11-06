@@ -299,6 +299,32 @@ jobs:
           time_ddl fts_ik_title_serial1 "ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_ts1(title) WITH PARSER ik;"
           time_ddl fts_ik_title_par6 "SET _force_parallel_ddl_dop=6; ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_tp6(title) WITH PARSER ik;"
           time_ddl fts_ik_content_serial2 "ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_s2(content) WITH PARSER ik;"
+
+          echo "=== DIAG instance shape ==="
+          $CLIENT -e "SHOW PARAMETERS LIKE 'memory_limit';" 2>&1 | head -4
+          OLOG=$(find "$INSTANCE" -name 'observer.log' -print -quit 2>/dev/null)
+          echo "  observer_log=$OLOG"
+          if [ -n "$OLOG" ]; then
+            grep -a "mini mode" "$OLOG" | head -2 | cut -c1-160
+            echo "  --- aux build task timeline ---"
+            grep -a "build index sstable finish" "$OLOG" | tail -16 | cut -c1-130
+            grep -a "build index sstable finish" "$OLOG" | grep -o "dest_table_id: [0-9]*" | tail -16
+            echo "  --- aux build inner sql ---"
+            grep -a "index sstable build task send innersql" "$OLOG" | tail -16 | cut -c1-130
+          fi
+
+          echo "=== DIAG ddl word scaling (LEFT(content, N)) ==="
+          for n in 0 40 80 160; do
+            $CLIENT -e "SET NAMES utf8mb4; DROP TABLE IF EXISTS fts_large_bench.docs_len$n; CREATE TABLE fts_large_bench.docs_len$n (id BIGINT AUTO_INCREMENT PRIMARY KEY, content TEXT NOT NULL) DEFAULT CHARSET = utf8mb4; INSERT INTO fts_large_bench.docs_len$n (content) SELECT LEFT(content, $n) FROM fts_large_bench.docs;" >/dev/null 2>&1
+            toks=$($CLIENT -N -s -e "SET NAMES utf8mb4; SELECT COUNT(tokenize(content, 'ik')) FROM fts_large_bench.docs_len$n;" 2>&1 | tail -1)
+            time_ddl fts_len$n "ALTER TABLE fts_large_bench.docs_len$n ADD FULLTEXT INDEX fti_len_$n(content) WITH PARSER ik;"
+            echo "    len=$n tokens=$toks"
+          done
+          echo "  --- aux row counts (best effort) ---"
+          for t in $($CLIENT -N -s -e "SELECT table_name FROM oceanbase.__all_virtual_table WHERE table_name LIKE '%diag_fti_s1%' OR table_name LIKE '%fti_len_%'" 2>/dev/null | head -12); do
+            cnt=$($CLIENT -N -s -e "SELECT COUNT(*) FROM fts_large_bench.\`$t\`" 2>&1 | tail -1)
+            echo "    aux_table=$t rows=$cnt"
+          done
           echo "=== DIAG end ==="
 
       - name: Collect seekdb logs on failure
