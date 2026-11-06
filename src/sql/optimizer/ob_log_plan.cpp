@@ -6815,13 +6815,6 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(stmt->get_select_exprs(select_exprs))) {
     } else if (OB_FAIL(select_into->get_select_exprs().assign(select_exprs))) {
-    } else {
-      for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_select_item_size(); ++i) {
-        const SelectItem &item = stmt->get_select_item(i);
-        const ObString &name = item.alias_name_.empty() ? item.expr_name_ : item.alias_name_;
-        if (OB_FAIL(select_into->get_select_names().push_back(name))) {
-        }
-      }
     }
     if (OB_SUCC(ret)) {
       select_into->set_into_type(into_item->into_type_);
@@ -12190,7 +12183,7 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
   uint64_t fwd_idx_tid = OB_INVALID_ID;
   uint64_t inv_idx_tid = OB_INVALID_ID;
   ObSEArray<ObAuxTableMetaInfo, 4> index_infos;
-  bool need_calc_relevance = true;
+  bool need_calc_relevance = false;  // EXPERIMENT: measure the cost of the BM25 path
   ObSEArray<ObExprConstraint, 2> constraints;
   uint64_t docid_col_id = OB_INVALID_ID;
   if (OB_ISNULL(match_against) || OB_ISNULL(get_stmt()) || OB_ISNULL(get_optimizer_context().get_query_ctx())) {
