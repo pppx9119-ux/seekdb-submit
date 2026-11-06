@@ -45,6 +45,7 @@ namespace storage
 static thread_local int64_t g_fts_seg_profile_docs = 0;
 static thread_local int64_t g_fts_seg_profile_setup_us = 0;
 static thread_local int64_t g_fts_seg_profile_iter_us = 0;
+static thread_local int64_t g_fts_seg_profile_addword_us = 0;
 static thread_local int64_t g_fts_seg_profile_words = 0;
 
 const char *ObFTParser::NAME_STR[ObFTParser::ParserType::FTP_MAX] = {
@@ -307,7 +308,12 @@ int ObFTParseHelper::segment(
         if (OB_FAIL(iter->get_next_token(word, word_len, char_cnt, word_freq))) {
           if (OB_ITER_END != ret) {
           }
-        } else if (OB_FAIL(add_word.process_word(word, word_len, char_cnt, word_freq))) {
+        } else {
+          const int64_t profile_word_begin = common::ObTimeUtility::fast_current_time();
+          if (OB_FAIL(add_word.process_word(word, word_len, char_cnt, word_freq))) {
+          } else {
+            g_fts_seg_profile_addword_us += common::ObTimeUtility::fast_current_time() - profile_word_begin;
+          }
         }
       }
       g_fts_seg_profile_setup_us += profile_setup - profile_begin;
@@ -409,7 +415,7 @@ int ObFTParseHelper::segment(
       g_fts_seg_profile_words += words.size();
       if (0 == g_fts_seg_profile_docs % 4096) {
         LOG_WARN("FTS_SEG_PROFILE", K(g_fts_seg_profile_docs), K(g_fts_seg_profile_setup_us),
-            K(g_fts_seg_profile_iter_us), K(g_fts_seg_profile_words));
+            K(g_fts_seg_profile_iter_us), K(g_fts_seg_profile_addword_us), K(g_fts_seg_profile_words));
       }
     }
   }
