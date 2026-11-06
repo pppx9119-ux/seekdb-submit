@@ -82,6 +82,7 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   } else if (cache_hit) {
     if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, cached_value))) {
     }
+  } else if (OB_FAIL(prepare_param(param))) {
   } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
   } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
                                                      ctx,
@@ -301,7 +302,16 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   } else if (OB_FAIL(parse_fulltext(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
+  }
+  return ret;
+}
+
+// Turning the raw options into the text the parser consumes is repeated work when
+// the same request arrives again, so a cache hit skips it together with segmentation.
+int ObExprTokenize::prepare_param(TokenizeParam &param)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
   } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
   }
   return ret;

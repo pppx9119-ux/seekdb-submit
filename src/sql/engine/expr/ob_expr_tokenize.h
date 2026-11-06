@@ -98,10 +98,14 @@ private:
                                common::ObIAllocator &allocator,
                                ObIJsonBase *&result);
 
+  // Built before the parser options are reformed, so a cache hit can skip that.
   // The key covers everything that may change the token set of a text.
   static int build_cache_key(common::ObIAllocator &allocator,
                              const TokenizeParam &param,
                              common::ObString &key);
+
+  // Reform the parser options and load the built-in dictionary on a cache miss.
+  static int prepare_param(TokenizeParam &param);
 
   // Stores the serialized json so an identical request can skip segmentation.
   static int cache_tokenize_result(const common::ObString &key,
