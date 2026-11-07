@@ -302,7 +302,7 @@ jobs:
 
           echo "=== DIAG instance shape ==="
           $CLIENT -e "SHOW PARAMETERS LIKE 'memory_limit';" 2>&1 | head -4
-          OLOG=$(find "$INSTANCE" -name 'observer.log' -print -quit 2>/dev/null)
+          OLOG=$(find "$INSTANCE" \( -name 'seekdb.log' -o -name 'observer.log' \) -print -quit 2>/dev/null)
           echo "  observer_log=$OLOG"
           if [ -n "$OLOG" ]; then
             grep -a "mini mode" "$OLOG" | head -2 | cut -c1-160
@@ -314,7 +314,7 @@ jobs:
           fi
 
           echo "=== DIAG fts segment profile ==="
-          PROF=$(find "$INSTANCE" -name 'observer.log*' 2>/dev/null | xargs -r grep -ah 'FTS_SEG_PROFILE\|FTS_ROW_PROFILE\|FTS_IK_PROFILE' | sort)
+          PROF=$(find "$INSTANCE" \( -name 'seekdb.log*' -o -name 'observer.log*' \) 2>/dev/null | xargs -r grep -ah 'FTS_SEG_PROFILE\|FTS_ROW_PROFILE\|FTS_IK_PROFILE' | sort)
           echo "  profile_lines=$(printf '%s\n' "$PROF" | grep -c .)"
           printf '%s\n' "$PROF" | head -72 | cut -c1-210
           echo "  --- profile tail ---"
@@ -342,11 +342,11 @@ jobs:
           for dir in "$PWD/.bench_instance" "$PWD/.test_instance"; do
             [ -d "$dir" ] || continue
             tag=$(basename "$dir")
-            find "$dir" -type f -name 'observer.log*' | while read -r f; do
+            find "$dir" -type f \( -name 'seekdb.log*' -o -name 'observer.log*' \) | while read -r f; do
               out="$GITHUB_WORKSPACE/seekdb-logs/${tag}-$(basename "$f").tail"
               tail -c 4000000 "$f" > "$out"
             done
-            find "$dir" -type f \( -name 'observer.log*' -o -name '*.log' \) -print0 2>/dev/null |
+            find "$dir" -type f \( -name 'seekdb.log*' -o -name 'observer.log*' -o -name '*.log' \) -print0 2>/dev/null |
               xargs -0 -r grep -h -a -E 'CRASH|FATAL|ERROR|signal [0-9]+|Traceback' 2>/dev/null |
               tail -n 3000 > "$GITHUB_WORKSPACE/seekdb-logs/${tag}-errors.txt"
           done
