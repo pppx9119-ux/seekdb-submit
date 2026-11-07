@@ -208,11 +208,24 @@ jobs:
           }
           trap cleanup EXIT
 
+          # A server left over from an earlier step would keep answering on the
+          # benchmark port while the instance started here is still booting, and
+          # the benchmark would silently measure that other binary.  Require a free
+          # port and prove that the instance started here owns it.
+          port_lines() { ss -ltnpH 2>/dev/null | grep -E '[:.]2881[[:space:]]' || true; }
+          echo "port 2881 before start:"
+          port_lines
           rm -rf "$INSTANCE"
-          python3 .github/script/seekdb/sdb.py start \
+          started=$(python3 .github/script/seekdb/sdb.py start \
             --binary "$PWD/build_release/src/observer/seekdb" \
             --base-dir "$INSTANCE" \
-            --port 2881
+            --port 2881)
+          echo "$started"
+          seekdb_pid=$(printf '%s\n' "$started" | sed -n 's/^started pid=\([0-9][0-9]*\)$/\1/p')
+          if [ -z "$seekdb_pid" ]; then
+            echo "cannot read the seekdb pid from: $started"
+            exit 1
+          fi
           python3 .github/script/seekdb/sdb.py wait-ready \
             --client "$CLIENT_ROOT/bin/obclient" \
             --base-dir "$INSTANCE" \
@@ -220,6 +233,14 @@ jobs:
             --port 2881 \
             --user root \
             --timeout 600
+          if command -v ss >/dev/null 2>&1 && ! port_lines | grep -q "pid=${seekdb_pid},"; then
+            echo "port 2881 is not served by seekdb pid=${seekdb_pid}:"
+            port_lines
+            exit 1
+          fi
+          echo "binary executed by pid=${seekdb_pid}:"
+          readlink -f "/proc/${seekdb_pid}/exe" || true
+          sha256sum "/proc/${seekdb_pid}/exe" || true
 
           # A single ddl build varies by tens of percent between runs on the same
           # runner, so the comparison below uses the median of several reports
@@ -299,6 +320,11 @@ jobs:
           time_ddl fts_ik_title_serial1 "ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_ts1(title) WITH PARSER ik;"
           time_ddl fts_ik_title_par6 "SET _force_parallel_ddl_dop=6; ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_tp6(title) WITH PARSER ik;"
           time_ddl fts_ik_content_serial2 "ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_s2(content) WITH PARSER ik;"
+          # The aux tables divide the ddl parallelism by three, so these two hint
+          # values are the only way to reach dop three and four while the floor is
+          # in place.
+          time_ddl fts_ik_content_par9 "SET _force_parallel_ddl_dop=9; ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_p9(content) WITH PARSER ik;"
+          time_ddl fts_ik_content_par12 "SET _force_parallel_ddl_dop=12; ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX diag_fti_p12(content) WITH PARSER ik;"
 
           echo "=== DIAG instance shape ==="
           $CLIENT -e "SHOW PARAMETERS LIKE 'memory_limit';" 2>&1 | head -4
@@ -399,6 +425,15 @@ jobs:
           print("all fts_index cases passed", flush=True)
           PY
 
+      - name: Destroy mysqltest instance
+        if: always()
+        timeout-minutes: 10
+        run: |
+          # The mysqltest runner keeps its server alive on the benchmark port;
+          # leaving it running would let the baseline benchmark talk to it instead
+          # of the baseline binary.
+          python3 .github/script/seekdb/sdb.py destroy --base-dir "$PWD/.test_instance" || true
+
       - name: Check out competition baseline for comparison
         id: baseline-checkout
         continue-on-error: true
@@ -435,8 +470,11 @@ jobs:
           # compiler flags, so a run can reuse the one built by an earlier run. The
           # cached file is verified before use and a failure falls back to a full build.
           if [ -f baseline-seekdb.bin ]; then
-            cp baseline-seekdb.bin build_release/src/observer/seekdb
-            chmod +x build_release/src/observer/seekdb
+            # Writing over a binary that a server still maps fails with ETXTBSY.
+            # Restore to a new file and rename it into place instead.
+            cp baseline-seekdb.bin build_release/src/observer/seekdb.restored
+            chmod +x build_release/src/observer/seekdb.restored
+            mv -f build_release/src/observer/seekdb.restored build_release/src/observer/seekdb
             if build_release/src/observer/seekdb --version; then
               echo "baseline binary restored from cache; skipping the rebuild"
               exit 0
@@ -490,17 +528,33 @@ jobs:
           CLIENT_ROOT="$PWD/deps/3rd/u01/obclient"
           export PATH="$CLIENT_ROOT/bin:$PATH"
           export LD_LIBRARY_PATH="$CLIENT_ROOT/lib:$CLIENT_ROOT/lib64:${LD_LIBRARY_PATH:-}"
+          echo "binaries used by this step:"
+          ls -l build_release/src/observer/seekdb baseline-seekdb.bin || true
+          sha256sum build_release/src/observer/seekdb baseline-seekdb.bin || true
           INSTANCE="$PWD/.bench_instance"
           cleanup() {
             python3 .github/script/seekdb/sdb.py stop --base-dir "$INSTANCE" || true
           }
           trap cleanup EXIT
 
+          # A server left over from an earlier step would keep answering on the
+          # benchmark port while the instance started here is still booting, and
+          # the benchmark would silently measure that other binary.  Require a free
+          # port and prove that the instance started here owns it.
+          port_lines() { ss -ltnpH 2>/dev/null | grep -E '[:.]2881[[:space:]]' || true; }
+          echo "port 2881 before start:"
+          port_lines
           rm -rf "$INSTANCE"
-          python3 .github/script/seekdb/sdb.py start \
+          started=$(python3 .github/script/seekdb/sdb.py start \
             --binary "$PWD/build_release/src/observer/seekdb" \
             --base-dir "$INSTANCE" \
-            --port 2881
+            --port 2881)
+          echo "$started"
+          seekdb_pid=$(printf '%s\n' "$started" | sed -n 's/^started pid=\([0-9][0-9]*\)$/\1/p')
+          if [ -z "$seekdb_pid" ]; then
+            echo "cannot read the seekdb pid from: $started"
+            exit 1
+          fi
           python3 .github/script/seekdb/sdb.py wait-ready \
             --client "$CLIENT_ROOT/bin/obclient" \
             --base-dir "$INSTANCE" \
@@ -508,6 +562,14 @@ jobs:
             --port 2881 \
             --user root \
             --timeout 600
+          if command -v ss >/dev/null 2>&1 && ! port_lines | grep -q "pid=${seekdb_pid},"; then
+            echo "port 2881 is not served by seekdb pid=${seekdb_pid}:"
+            port_lines
+            exit 1
+          fi
+          echo "binary executed by pid=${seekdb_pid}:"
+          readlink -f "/proc/${seekdb_pid}/exe" || true
+          sha256sum "/proc/${seekdb_pid}/exe" || true
 
           for run in $(seq 1 6); do
             echo "=== BENCH RUN baseline ${run}/6 ==="
