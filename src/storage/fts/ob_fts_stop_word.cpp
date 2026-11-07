@@ -158,18 +158,46 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
 }
 
+// Casedown only rewrites the characters that Unicode gives a lower case
+// mapping.  Apart from the ASCII letters those scripts never appear in a run of
+// ideographs, so such a word can be used as it is and the copy is skipped.
+static bool needs_casedown(const char *ptr, const int64_t len)
+{
+  bool needs = false;
+  int64_t i = 0;
+  while (!needs && i < len) {
+    const unsigned char c = static_cast<unsigned char>(ptr[i]);
+    if (c < 0x80) {
+      needs = c >= 'A' && c <= 'Z';
+      ++i;
+    } else if (c >= 0xE3 && c <= 0xE9 && i + 2 < len
+               && (static_cast<unsigned char>(ptr[i + 1]) & 0xC0) == 0x80
+               && (static_cast<unsigned char>(ptr[i + 2]) & 0xC0) == 0x80) {
+      // U+3000 - U+9FFF: CJK symbols, kana, hangul jamo and ideographs.
+      i += 3;
+    } else {
+      needs = true;
+    }
+  }
+  return needs;
+}
+
 int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (flag_.casedown()) {
+    const ObString &src_str = src.get_word().get_string();
     ObString dst_str;
-    if (OB_FAIL(ObCharset::tolower(
-                    word_meta_.get_collation_type(),
-                    src.get_word().get_string(),
-                    dst_str,
-                    allocator_))) {
+    if (!needs_casedown(src_str.ptr(), src_str.length())) {
+      // Every token points into the fulltext buffer, which outlives the word
+      // map that is built from it, so the word can be kept without a copy.
+      dst = src;
+    } else if (OB_FAIL(ObCharset::tolower(word_meta_.get_collation_type(),
+                                          src_str,
+                                          dst_str,
+                                          allocator_))) {
     } else {
       ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
       dst = tmp;
