@@ -22,7 +22,6 @@
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_macro_utils.h"
-#include "lib/time/ob_time_utility.h"
 #include "lib/utility/utility.h"
 #include "data_plane/fts/ob_fts_struct.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
@@ -40,13 +39,6 @@ namespace oceanbase
 {
 namespace storage
 {
-// Temporary build profile: split the per document parser construction into the
-// dictionary lookup, the tokenize context allocation and the segmenter setup.
-static thread_local int64_t g_fts_ik_profile_parsers = 0;
-static thread_local int64_t g_fts_ik_profile_dict_us = 0;
-static thread_local int64_t g_fts_ik_profile_ctx_us = 0;
-static thread_local int64_t g_fts_ik_profile_segmenter_us = 0;
-
 int ObIKFTParser::init(const ObFTParserParam &param)
 {
   int ret = OB_SUCCESS;
@@ -59,28 +51,9 @@ int ObIKFTParser::init(const ObFTParserParam &param)
       ret = OB_INVALID_ARGUMENT;
     } else if (CS_TYPE_INVALID == (coll_type_ = ObCharset::collation_type(param.cs_->name))) {
       ret = OB_INVALID_ARGUMENT;
-    } else {
-      const int64_t profile_begin = common::ObTimeUtility::fast_current_time();
-      if (OB_FAIL(init_dict(param))) {
-      } else {
-        const int64_t profile_dict = common::ObTimeUtility::fast_current_time();
-        if (OB_FAIL(init_ctx(param))) {
-        } else {
-          const int64_t profile_ctx = common::ObTimeUtility::fast_current_time();
-          if (OB_FAIL(init_segmenter(param))) {
-          } else {
-            const int64_t profile_end = common::ObTimeUtility::fast_current_time();
-            g_fts_ik_profile_dict_us += profile_dict - profile_begin;
-            g_fts_ik_profile_ctx_us += profile_ctx - profile_dict;
-            g_fts_ik_profile_segmenter_us += profile_end - profile_ctx;
-            ++g_fts_ik_profile_parsers;
-            if (0 == g_fts_ik_profile_parsers % 4096) {
-              LOG_WARN("FTS_IK_PROFILE", K(g_fts_ik_profile_parsers), K(g_fts_ik_profile_dict_us),
-                  K(g_fts_ik_profile_ctx_us), K(g_fts_ik_profile_segmenter_us));
-            }
-          }
-        }
-      }
+    } else if (OB_FAIL(init_dict(param))) {
+    } else if (OB_FAIL(init_ctx(param))) {
+    } else if (OB_FAIL(init_segmenter(param))) {
     }
 
     if (OB_FAIL(ret)) {

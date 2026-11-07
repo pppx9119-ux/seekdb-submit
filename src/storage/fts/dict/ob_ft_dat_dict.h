@@ -174,6 +174,17 @@ public:
                      const ObDATrieHit &last_hit,
                      ObDATrieHit &hit) const;
 
+  // Resolve the trie code of a single word, so that a caller which continues
+  // several active hits with the same character probes the map only once.
+  int find_code(const ObString &single_word, ObFTWordCode &code, bool &found) const;
+
+  // Continue a match with a word whose code is already resolved.
+  int match_with_code(const int64_t char_len,
+                      const ObFTWordCode code,
+                      const bool found,
+                      const ObDATrieHit &last_hit,
+                      ObDATrieHit &hit) const;
+
 private:
   ObFTDAT *dat_;
 

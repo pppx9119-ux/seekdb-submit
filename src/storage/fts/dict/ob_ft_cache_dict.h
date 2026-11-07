@@ -17,6 +17,9 @@
 #ifndef _OCEANBASE_STORAGE_FTS_DICT_OB_FT_CACHE_DICT_H_
 #define _OCEANBASE_STORAGE_FTS_DICT_OB_FT_CACHE_DICT_H_
 
+#include <atomic>
+#include <cstdint>
+
 #include "lib/allocator/ob_allocator.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/utility/ob_macro_utils.h"
@@ -33,9 +36,19 @@ namespace storage
 class ObFTCacheDict final : public ObIFTDict
 {
 public:
+  // One slot per distinct character seen in a range: the same characters repeat
+  // in every document, so memoizing the trie code removes the map probe from
+  // the per character path.
+  static constexpr int64_t CHAR_CODE_CACHE_SIZE = 4096;
+  static constexpr uint32_t CHAR_CODE_NOT_FOUND = 0xFFFFFFFFu;
+
+public:
   ObFTCacheDict(ObCollationType coll_type, ObFTDAT *dat)
       : coll_type_(coll_type), dat_(dat), reader_(dat)
   {
+    for (int64_t i = 0; i < CHAR_CODE_CACHE_SIZE; ++i) {
+      char_code_cache_[i].store(0, std::memory_order_relaxed);
+    }
   }
   int init() override;
   int match(const ObString &single_word, ObDATrieHit &hit) const override;
@@ -53,6 +66,14 @@ public:
                                         ObKVCacheHandle &handle);
 
 private:
+  // Resolve the code of a single character through the memo.  A cache entry
+  // packs the character bytes and its code into one word, so a reader can never
+  // observe a mismatched pair: a stale or lost store only causes a new probe.
+  int resolve_char(const ObString &single_word, ObFTWordCode &code, bool &found) const;
+  static uint32_t char_code_key(const ObString &single_word);
+
+private:
+  mutable std::atomic<uint64_t> char_code_cache_[CHAR_CODE_CACHE_SIZE];
   ObKVCacheHandle handle_; // used to pin the mem block later
   ObCollationType coll_type_;
   ObFTDAT *dat_ = nullptr;

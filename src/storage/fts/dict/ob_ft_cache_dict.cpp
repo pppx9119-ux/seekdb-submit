@@ -41,7 +41,84 @@ int ObFTCacheDict::init()
 
 int ObFTCacheDict::match(const ObString &single_word, ObDATrieHit &hit) const
 {
-  return reader_.match_with_hit(single_word, hit, hit);
+  int ret = OB_SUCCESS;
+  ObFTWordCode code = 0;
+  bool found = false;
+  if (OB_FAIL(resolve_char(single_word, code, found))) {
+  } else {
+    ret = reader_.match_with_code(single_word.length(), code, found, hit, hit);
+  }
+  return ret;
+}
+
+uint32_t ObFTCacheDict::char_code_key(const ObString &single_word)
+{
+  // The memo only applies to a single character; pack its bytes into the key so
+  // that equal keys always mean the same character.
+  const uint8_t *ptr = reinterpret_cast<const uint8_t *>(single_word.ptr());
+  uint32_t key = 0;
+  switch (single_word.length()) {
+    case 1:
+      key = ptr[0];
+      break;
+    case 2:
+      key = (static_cast<uint32_t>(ptr[0]) << 8) | static_cast<uint32_t>(ptr[1]);
+      break;
+    case 3:
+      key = (static_cast<uint32_t>(ptr[0]) << 16) | (static_cast<uint32_t>(ptr[1]) << 8)
+            | static_cast<uint32_t>(ptr[2]);
+      break;
+    case 4:
+      key = (static_cast<uint32_t>(ptr[0]) << 24) | (static_cast<uint32_t>(ptr[1]) << 16)
+            | (static_cast<uint32_t>(ptr[2]) << 8) | static_cast<uint32_t>(ptr[3]);
+      break;
+    default:
+      key = 0;
+      break;
+  }
+  return key;
+}
+
+int ObFTCacheDict::resolve_char(const ObString &single_word,
+                                ObFTWordCode &code,
+                                bool &found) const
+{
+  int ret = OB_SUCCESS;
+  code = 0;
+  found = false;
+  const uint32_t key = char_code_key(single_word);
+  if (0 == key) {
+    ret = reader_.find_code(single_word, code, found);
+  } else {
+    const uint32_t mask = static_cast<uint32_t>(CHAR_CODE_CACHE_SIZE) - 1;
+    uint32_t slot = (key * 2654435761u) >> 20;
+    bool cached = false;
+    for (int64_t probe = 0; !cached && probe < 4; ++probe) {
+      const uint64_t entry = char_code_cache_[slot].load(std::memory_order_relaxed);
+      const uint32_t entry_key = static_cast<uint32_t>(entry >> 32);
+      if (0 == entry) {
+        break;
+      } else if (entry_key == key) {
+        const uint32_t stored = static_cast<uint32_t>(entry);
+        if (CHAR_CODE_NOT_FOUND != stored) {
+          code = static_cast<ObFTWordCode>(stored);
+          found = true;
+        }
+        cached = true;
+      } else {
+        slot = (slot + 1) & mask;
+      }
+    }
+    if (!cached) {
+      if (OB_FAIL(reader_.find_code(single_word, code, found))) {
+      } else {
+        const uint32_t stored = found ? static_cast<uint32_t>(code) : CHAR_CODE_NOT_FOUND;
+        char_code_cache_[slot].store((static_cast<uint64_t>(key) << 32) | stored,
+                                     std::memory_order_relaxed);
+      }
+    }
+  }
+  return ret;
 }
 
 int ObFTCacheDict::match(const ObString &words, bool &is_match) const
@@ -73,7 +150,14 @@ int ObFTCacheDict::match_with_hit(const ObString &single_word,
                                   const ObDATrieHit &last_hit,
                                   ObDATrieHit &hit) const
 {
-  return reader_.match_with_hit(single_word, last_hit, hit);
+  int ret = OB_SUCCESS;
+  ObFTWordCode code = 0;
+  bool found = false;
+  if (OB_FAIL(resolve_char(single_word, code, found))) {
+  } else {
+    ret = reader_.match_with_code(single_word.length(), code, found, last_hit, hit);
+  }
+  return ret;
 }
 
 int ObFTCacheDict::make_and_fetch_cache_entry(const ObFTDictDesc &desc,

@@ -416,6 +416,14 @@ jobs:
           git checkout --detach "$BASELINE_SHA"
           git log -1 --format='baseline checkout: %H %s'
 
+      - name: Restore cached baseline binary
+        id: baseline-binary-cache
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: baseline-seekdb.bin
+          key: seekdb-fts-baseline-bin-${{ env.BASELINE_SHA }}-v1
+
       - name: Rebuild seekdb binary (baseline, incremental)
         id: baseline-build
         if: steps.baseline-checkout.outcome == 'success'
@@ -423,6 +431,18 @@ jobs:
         timeout-minutes: 120
         run: |
           set -uo pipefail
+          # The baseline binary only depends on BASELINE_SHA, the pinned deps and the
+          # compiler flags, so a run can reuse the one built by an earlier run. The
+          # cached file is verified before use and a failure falls back to a full build.
+          if [ -f baseline-seekdb.bin ]; then
+            cp baseline-seekdb.bin build_release/src/observer/seekdb
+            chmod +x build_release/src/observer/seekdb
+            if build_release/src/observer/seekdb --version; then
+              echo "baseline binary restored from cache; skipping the rebuild"
+              exit 0
+            fi
+            echo "cached baseline binary is not runnable; falling back to a full rebuild"
+          fi
           export PATH="$PWD/deps/3rd/usr/local/oceanbase/devtools/bin:$PATH"
           cd build_release || exit 1
 
@@ -451,6 +471,15 @@ jobs:
             exit "$rc"
           fi
           ls -lh src/observer/seekdb
+          cp src/observer/seekdb "$GITHUB_WORKSPACE/baseline-seekdb.bin"
+
+      - name: Save baseline binary
+        if: steps.baseline-build.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: baseline-seekdb.bin
+          key: seekdb-fts-baseline-bin-${{ env.BASELINE_SHA }}-v1
 
       - name: Run FTS benchmark (baseline)
         if: steps.baseline-build.outcome == 'success'
