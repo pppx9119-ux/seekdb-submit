@@ -17,7 +17,6 @@
 #define USING_LOG_PREFIX STORAGE_FTS
 #include "ob_fts_index_builder_util.h"
 #include "ob_index_builder_util.h"
-#include "lib/cpu/ob_cpu_topology.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
@@ -1032,16 +1031,6 @@ int ObFtsIndexBuilderUtil::generate_doc_id_column(
   return ret;
 }
 
-// The data of an aux table is written by an inner sql whose scan, tokenization
-// and row construction are fanned out over its workers, so a serial plan leaves
-// the machine mostly idle while a fulltext index is built.  Keep a few workers
-// for those tables even when the ddl statement did not ask for parallelism, and
-// stay well below the number of cores because the writer itself is serial.
-static int64_t fts_aux_parallelism()
-{
-  return MIN(4, MAX(2, get_cpu_count() / 2));
-}
-
 int ObFtsIndexBuilderUtil::decide_parallelism(
     const share::schema::ObIndexType index_type,
     const int64_t original_parallelism,
@@ -1058,7 +1047,7 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        decided_parallelism = MAX(original_parallelism / 3, fts_aux_parallelism());
+        decided_parallelism = MAX(original_parallelism / 3, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
