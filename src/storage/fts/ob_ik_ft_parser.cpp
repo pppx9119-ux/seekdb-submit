@@ -126,10 +126,8 @@ int ObIKFTParser::process_one_char(TokenizeContext &ctx,
 {
   int ret = OB_SUCCESS;
   // proces by char with all segmenters
-  for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
-       OB_SUCC(ret) && iter != segmenters_.end();
-       iter++) {
-    if (OB_FAIL((*iter)->process(ctx, ch, char_len, type))) {
+  for (int64_t i = 0; OB_SUCC(ret) && i < segmenters_.count(); ++i) {
+    if (OB_FAIL(segmenters_.at(i)->process(ctx, ch, char_len, type))) {
     }
   }
   return ret;
@@ -313,13 +311,14 @@ void ObIKFTParser::reset()
     allocator_.free(ctx_);
   }
 
-  for (ObIIKProcessor *segmenter : segmenters_) {
+  for (int64_t i = 0; i < segmenters_.count(); ++i) {
+    ObIIKProcessor *segmenter = segmenters_.at(i);
     if (!OB_ISNULL(segmenter)) {
       segmenter->~ObIIKProcessor();
       allocator_.free(segmenter);
     }
   }
-  segmenters_.clear();
+  segmenters_.reuse();
 
   // dict_main_ and dict_quan_ are owned by the dict hub, do not free them here.
   dict_main_ = nullptr;

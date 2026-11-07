@@ -38,10 +38,9 @@ int ObIKCJKProcessor::do_process(TokenizeContext &ctx,
 
   if (ObFTCharUtil::CharType::USELESS != type) {
     // handle previous hits_ first and then check from this char
-    for (ObList<ObDATrieHit, ObIAllocator>::iterator iter = hits_.begin();
-         OB_SUCC(ret) && iter != hits_.end();
-         iter++) {
-      ObDATrieHit &hit = *iter;
+    int64_t kept = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < hits_.count(); ++i) {
+      ObDATrieHit &hit = hits_.at(i);
       if (OB_FAIL(dict_main_.match_with_hit({char_len, ch}, hit, hit))) {
       } else if (hit.is_match()) {
         if (OB_FAIL(ctx.add_token(ctx.fulltext(),
@@ -55,9 +54,22 @@ int ObIKCJKProcessor::do_process(TokenizeContext &ctx,
       } else if (hit.is_prefix()) {
         // nothing
       } else if (hit.is_unmatch()) {
-        hits_.erase(hit);
       } else {
         ret = OB_UNEXPECT_INTERNAL_ERROR;
+      }
+      if (OB_SUCC(ret) && !hit.is_unmatch()) {
+        if (kept != i) {
+          hits_.at(kept) = hit;
+          // The assignment leaves the dictionary pointer of the target alone,
+          // and every hit has to keep the range it was started with.
+          hits_.at(kept).dict_ = hit.dict_;
+        }
+        ++kept;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      while (hits_.count() > kept) {
+        hits_.pop_back();
       }
     }
     if (OB_SUCC(ret)) {
@@ -67,29 +79,31 @@ int ObIKCJKProcessor::do_process(TokenizeContext &ctx,
       if (OB_FAIL(dict_main_.match({char_len, ch}, hit))) {
       } else if (hit.is_match()) {
         // output token
-        hits_.push_back(hit);
-        ctx.add_token(ctx.fulltext(),
-                      ctx.get_cursor(),
-                      char_len,
-                      1,
-                      ObIKTokenType::IK_CHINESE_TOKEN);
+        if (OB_FAIL(hits_.push_back(hit))) {
+        } else if (OB_FAIL(ctx.add_token(ctx.fulltext(),
+                                         ctx.get_cursor(),
+                                         char_len,
+                                         1,
+                                         ObIKTokenType::IK_CHINESE_TOKEN))) {
+        }
       } else if (hit.is_prefix()) {
-        hits_.push_back(hit);
+        if (OB_FAIL(hits_.push_back(hit))) {
+        }
       } else {
         // ignore mismatch
       }
     }
   } else {
     // stop previous match
-    hits_.clear();
+    hits_.reuse();
   }
 
   if (OB_SUCC(ret)) {
     if (ctx.is_last()) {
-      hits_.clear();
+      hits_.reuse();
     }
   } else {
-    hits_.clear();
+    hits_.reuse();
   }
 
   return ret;
