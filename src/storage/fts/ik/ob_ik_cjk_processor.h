@@ -18,7 +18,6 @@
 #define _OCEANBASE_STORAGE_FTS_IK_OB_IK_CJK_PROCESSOR_H_
 
 #include "lib/allocator/ob_allocator.h"
-#include "lib/container/ob_se_array.h"
 #include "storage/fts/dict/ob_ft_dict.h"
 #include "storage/fts/ik/ob_ik_processor.h"
 
@@ -43,9 +42,7 @@ public:
                  const ObFTCharUtil::CharType type) override;
 
 private:
-  // At most a handful of characters are being matched at the same time, so the
-  // hits are kept inline instead of in a node per character.
-  ObSEArray<ObDATrieHit, 8> hits_;
+  ObList<ObDATrieHit, ObIAllocator> hits_;
   const ObIFTDict &dict_main_;
   int64_t cjk_start_;
   int64_t cjk_end_;

@@ -40,7 +40,7 @@ public:
         coll_type_(ObCollationType::CS_TYPE_INVALID),
         ctx_(nullptr),
         hub_(hub),
-        segmenters_(allocator_),
+        segmenters_(),
         dict_main_(nullptr),
         dict_quan_(nullptr)
   {
@@ -86,8 +86,9 @@ private:
   ObCollationType coll_type_;
   TokenizeContext *ctx_;
   ObFTDictHub *hub_;
-  // Every character is offered to each segmenter, so the list is walked once
-  // per character of the document.
+  // Every character is offered to each segmenter, so this is walked once per
+  // character of the document.  The four segmenters fit in the inline buffer,
+  // which keeps the walk off the allocator.
   ObSEArray<ObIIKProcessor *, 4> segmenters_;
 
   // Built-in dicts are immutable and shared process-wide, so the parser only
