@@ -19,8 +19,6 @@
 
 #include <atomic>
 #include <cstdlib>
-#include <cstring>
-#include <unistd.h>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -106,15 +104,6 @@ namespace
 // Diagnostic tracing for the replay cache.  The server emits these lines only
 // when OB_FTS_REPLAY_TRACE is set, and the budget keeps a long benchmark from
 // flooding the log.
-void replay_mark(const char *tag)
-{
-  static const bool enabled = nullptr != ::getenv("OB_FTS_REPLAY_TRACE");
-  if (enabled) {
-    const ssize_t written = ::write(2, tag, ::strlen(tag));
-    UNUSED(written);
-  }
-}
-
 bool replay_trace()
 {
   static const bool enabled = nullptr != ::getenv("OB_FTS_REPLAY_TRACE");
@@ -1100,7 +1089,6 @@ int ObDASLegacyTRMergeIter::rescan()
 int ObDASLegacyTRMergeIter::inner_release()
 {
   int ret = OB_SUCCESS;
-  replay_mark("ftsmark L0 release\n");
   if (OB_NOT_NULL(total_doc_cnt_scan_param_)) {
     total_doc_cnt_scan_param_->destroy_schema_guard();
     total_doc_cnt_scan_param_->snapshot_.reset();
@@ -1162,7 +1150,6 @@ int ObDASLegacyTRMergeIter::inner_release()
   topk_limit_ = 0;
   inv_idx_tablet_switched_ = false;
   is_inited_ = false;
-  replay_mark("ftsmark L1 released\n");
   return ret;
 }
 
@@ -1207,7 +1194,6 @@ int ObDASLegacyTRMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity
       }
       if (OB_ITER_END == ret) {
         finish_replay_collection();
-        replay_mark("ftsmark N0 batch done\n");
       }
     } else {
       collecting_entry_.reset();
@@ -1757,7 +1743,6 @@ void ObDASLegacyTRMergeIter::finish_replay_collection()
   }
   std::shared_ptr<ObFTSReplayEntry> entry = collecting_entry_;
   collecting_entry_.reset();
-  replay_mark("ftsmark F0 finish\n");
   if (OB_ISNULL(snapshot_) || OB_ISNULL(ir_rtdef_)) {
     return;
   }
@@ -1774,9 +1759,7 @@ void ObDASLegacyTRMergeIter::finish_replay_collection()
              static_cast<int64_t>(entry->rows_.size()), K(topk_mode_),
              K(topk_limit_));
   }
-  replay_mark("ftsmark F1 versions\n");
   if (!end_version.is_valid() || !scan_version.is_valid()) {
-    replay_mark("ftsmark Fv invalid version\n");
     return;
   }
   // The row set is only a stable statement snapshot when no commit the service
@@ -1784,11 +1767,9 @@ void ObDASLegacyTRMergeIter::finish_replay_collection()
   // recorded version.  Otherwise a later replay could disagree with a fresh
   // scan.
   if (end_version != entry->commit_ts_ || scan_version < entry->version_) {
-    replay_mark("ftsmark Fm version moved\n");
     return;
   }
   if (entry->score_unstable_) {
-    replay_mark("ftsmark Fu unstable score\n");
     return;
   }
   const ObDASScanRtDef *inv_scan_rtdef = ir_rtdef_->get_inv_idx_scan_rtdef();
@@ -1802,13 +1783,11 @@ void ObDASLegacyTRMergeIter::finish_replay_collection()
   entry->ends_with_limit_ = !topk_mode_ && limit_param.is_valid()
       && static_cast<int64_t>(entry->rows_.size()) >= limit_param.limit_;
   entry->complete_ = true;
-  replay_mark("ftsmark F3 publish\n");
   try {
     ObFTSReplayCache::instance().put(entry);
   } catch (...) {
     LOG_WARN_RET(OB_SUCCESS, "failed to publish a text retrieval replay result");
   }
-  replay_mark("ftsmark F4 published\n");
 }
 
 int ObDASLegacyTRMergeIter::replay_get_next_row()
@@ -1841,7 +1820,6 @@ int ObDASLegacyTRMergeIter::replay_get_next_rows(int64_t &count, int64_t capacit
     if (replay_pos_ >= total) {
       ret = OB_ITER_END;
     } else {
-      replay_mark("ftsmark R0 replay rows\n");
       ObEvalCtx *eval_ctx = ir_rtdef_->eval_ctx_;
       // The top-k iterator fills as much of the caller's capacity as the heap
       // still holds; the merge iterator caps its batches at max_batch_size_.
@@ -1886,7 +1864,6 @@ int ObDASLegacyTRMergeIter::replay_get_next_rows(int64_t &count, int64_t capacit
       if (replay_pos_ >= total && entry.ends_with_limit_) {
         ret = OB_ITER_END;
       }
-      replay_mark("ftsmark R1 replay filled\n");
     }
   }
   return ret;
@@ -2038,7 +2015,6 @@ public:
       // The facade owns the DAS tree.  Release physical state while dynamic
       // dispatch still sees the legacy derived type, but never recurse into
       // or destruct the borrowed children.
-      replay_mark("ftsmark D0 destroy\n");
       iter_->set_children_cnt(0);
       iter_->get_children() = nullptr;
       if (iter_->is_inited()) {
@@ -2046,11 +2022,11 @@ public:
         if (OB_SUCCESS != ret) {
         }
       }
-      replay_mark("ftsmark D1 released\n");
-      iter_->~ObDASLegacyTRMergeIter();
-      replay_mark("ftsmark D2 destructed\n");
+      // The destructor must not run: ~ObDASIter() calls release(), which
+      // invokes the pure virtual inner_release() on an object whose derived
+      // part is already gone.  release() above already dropped all physical
+      // state, including the replay entry, so free the storage directly.
       allocator->free(iter_);
-      replay_mark("ftsmark D3 freed\n");
       iter_ = nullptr;
     }
     this->~ObDASLegacyTextRetrievalEngine();
