@@ -200,6 +200,10 @@ jobs:
         run: |
           set -euo pipefail
           export OB_FTS_REPLAY_TRACE=1
+          # A fatal fault currently leaves no log line: the server log is
+          # asynchronous.  Keep a core file so the failing stack can be read.
+          echo "$PWD/core.%e.%p" | sudo tee /proc/sys/kernel/core_pattern >/dev/null 2>&1 || true
+          ulimit -c unlimited || true
           CLIENT_ROOT="$PWD/deps/3rd/u01/obclient"
           export PATH="$CLIENT_ROOT/bin:$PATH"
           export LD_LIBRARY_PATH="$CLIENT_ROOT/lib:$CLIENT_ROOT/lib64:${LD_LIBRARY_PATH:-}"
@@ -302,6 +306,21 @@ jobs:
               echo "ip=${crash_ip}"
               addr2line -f -C -e build_release/src/observer/seekdb "0x${crash_ip}" || true
             fi
+            echo "--- cores"
+            ls -la "$PWD"/core.* 2>/dev/null || true
+            for core_file in "$PWD"/core.*; do
+              if [ -f "${core_file}" ]; then
+                echo "--- backtrace ${core_file}"
+                if ! command -v gdb >/dev/null 2>&1; then
+                  sudo apt-get update -qq >/dev/null 2>&1 || true
+                  sudo apt-get install -y -qq gdb >/dev/null 2>&1 || true
+                fi
+                if command -v gdb >/dev/null 2>&1; then
+                  gdb -batch -nx -ex "thread apply all bt 16" \
+                    build_release/src/observer/seekdb "${core_file}" 2>&1 | head -400 || true
+                fi
+              fi
+            done
             echo "--- memory"
             free -h || true
             echo "=== BENCH FAILURE DIAGNOSTICS END ==="
