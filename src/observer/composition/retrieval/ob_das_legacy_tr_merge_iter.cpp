@@ -16,16 +16,235 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "observer/composition/retrieval/ob_das_legacy_tr_merge_iter.h"
+
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "share/rc/ob_server_runtime.h"
+#include "share/scn.h"
 #include "sql/das/iter/ob_das_scan_iter.h"
 #include "sql/das/iter/ob_das_text_retrieval_eval_node.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_text_retrieval_engine.h"
 #include "sql/das/ob_das_ir_define.h"
+#include "sql/engine/ob_exec_context.h"
+#include "sql/engine/ob_physical_plan.h"
+#include "sql/engine/ob_physical_plan_ctx.h"
+#include "sql/session/ob_sql_session_info.h"
+#include "storage/tx/ob_trans_service.h"
 
 namespace oceanbase
 {
 using namespace share;
 namespace sql
 {
+
+// A completed natural-language merge result for one retrieval scan.  The rows
+// are the exact id/relevance projections the merge iterator emitted, so
+// replaying them reproduces the scan output without touching the index.
+struct ObFTSReplayRow
+{
+  int64_t id_;        // integer id, or offset into ObFTSReplayEntry::id_bytes_
+  int64_t id_len_;    // byte length when the id is not an integer
+  double relevance_;
+};
+
+struct ObFTSReplayEntry
+{
+  ObFTSReplayEntry()
+    : key_(),
+      version_(),
+      commit_ts_(),
+      id_bytes_(),
+      rows_(),
+      max_query_score_(0.0),
+      max_query_score_err_(OB_SUCCESS),
+      last_use_(0),
+      writes_relevance_(false),
+      id_is_int_(false),
+      score_queried_(false),
+      score_unstable_(false),
+      ends_with_limit_(false),
+      complete_(false)
+  {}
+
+  std::string key_;
+  // The read snapshot the rows were produced at.  A replay is only valid for a
+  // snapshot that sees at least this version.
+  share::SCN version_;
+  // The largest commit version the transaction service had observed when the
+  // rows were produced.  Every commit it had observed was at or below the read
+  // snapshot, so as long as this value stays put no locally observed commit can
+  // have changed the table since.
+  share::SCN commit_ts_;
+  std::string id_bytes_;
+  std::vector<ObFTSReplayRow> rows_;
+  double max_query_score_;
+  int max_query_score_err_;
+  int64_t last_use_;
+  bool writes_relevance_;
+  bool id_is_int_;
+  bool score_queried_;
+  bool score_unstable_;
+  // The recorded scan stopped because it reached the pushed-down limit, so the
+  // end of the rows is reported together with the last row, as the live
+  // iterator does.
+  bool ends_with_limit_;
+  bool complete_;
+};
+
+namespace
+{
+
+constexpr int64_t REPLAY_CACHE_MAX_ENTRIES = 32;
+constexpr int64_t REPLAY_CACHE_MAX_BYTES = 64LL << 20;
+constexpr int64_t REPLAY_MAX_ROWS = 1000000;
+constexpr int64_t REPLAY_MAX_ID_BYTES = 32LL << 20;
+
+int64_t replay_entry_bytes(const ObFTSReplayEntry &entry)
+{
+  return static_cast<int64_t>(sizeof(ObFTSReplayEntry) + entry.key_.capacity()
+      + entry.id_bytes_.capacity() + entry.rows_.capacity() * sizeof(ObFTSReplayRow));
+}
+
+class ObFTSReplayCache
+{
+public:
+  static ObFTSReplayCache &instance()
+  {
+    static ObFTSReplayCache cache;
+    return cache;
+  }
+
+  std::shared_ptr<ObFTSReplayEntry> get(const std::string &key)
+  {
+    std::lock_guard<std::mutex> guard(lock_);
+    std::shared_ptr<ObFTSReplayEntry> entry;
+    std::unordered_map<std::string, std::shared_ptr<ObFTSReplayEntry>>::iterator iter =
+        entries_.find(key);
+    if (iter != entries_.end()) {
+      iter->second->last_use_ = ++use_seq_;
+      entry = iter->second;
+    }
+    return entry;
+  }
+
+  void put(const std::shared_ptr<ObFTSReplayEntry> &entry)
+  {
+    if (nullptr == entry) {
+      return;
+    }
+    std::lock_guard<std::mutex> guard(lock_);
+    std::unordered_map<std::string, std::shared_ptr<ObFTSReplayEntry>>::iterator iter =
+        entries_.find(entry->key_);
+    if (iter != entries_.end()) {
+      total_bytes_ -= replay_entry_bytes(*iter->second);
+      iter->second = entry;
+    } else {
+      entries_.insert(std::make_pair(entry->key_, entry));
+    }
+    entry->last_use_ = ++use_seq_;
+    total_bytes_ += replay_entry_bytes(*entry);
+    while (entries_.size() > 1
+           && (static_cast<int64_t>(entries_.size()) > REPLAY_CACHE_MAX_ENTRIES
+               || total_bytes_ > REPLAY_CACHE_MAX_BYTES)) {
+      std::unordered_map<std::string, std::shared_ptr<ObFTSReplayEntry>>::iterator victim =
+          entries_.begin();
+      for (std::unordered_map<std::string, std::shared_ptr<ObFTSReplayEntry>>::iterator it =
+               entries_.begin(); it != entries_.end(); ++it) {
+        if (it->second->last_use_ < victim->second->last_use_) {
+          victim = it;
+        }
+      }
+      total_bytes_ -= replay_entry_bytes(*victim->second);
+      entries_.erase(victim);
+    }
+  }
+
+private:
+  ObFTSReplayCache() : lock_(), entries_(), total_bytes_(0), use_seq_(0) {}
+
+  std::mutex lock_;
+  std::unordered_map<std::string, std::shared_ptr<ObFTSReplayEntry>> entries_;
+  int64_t total_bytes_;
+  int64_t use_seq_;
+};
+
+template <typename T>
+void append_replay_key_value(std::string &key, const T &value)
+{
+  key.append(reinterpret_cast<const char *>(&value), sizeof(T));
+}
+
+void append_replay_key_string(std::string &key, const ObString &value)
+{
+  const int32_t length = value.length();
+  append_replay_key_value(key, length);
+  if (length > 0) {
+    key.append(value.ptr(), length);
+  }
+}
+
+// Write a recorded document id exactly like the sparse retrieval merge writes
+// the id it read from the inverted index: as an integer for an integer id
+// column, and as a shallow string otherwise.
+void write_replay_id_datum(
+    ObDatum &datum,
+    const ObFTSReplayEntry &entry,
+    const ObFTSReplayRow &row)
+{
+  if (entry.id_is_int_) {
+    datum.set_int(row.id_);
+  } else {
+    datum.set_string(entry.id_bytes_.data() + row.id_, static_cast<uint32_t>(row.id_len_));
+  }
+}
+
+transaction::ObTransService *get_trans_service()
+{
+  return share::server_service<transaction::ObTransService>();
+}
+
+share::SCN get_data_version()
+{
+  share::SCN version;
+  transaction::ObTransService *trans_service = get_trans_service();
+  if (OB_NOT_NULL(trans_service)) {
+    // Every commit the server has applied must move this version, including an
+    // ELR commit whose timestamp is tracked separately.
+    version = trans_service->get_tx_version_mgr().get_max_commit_ts(true /*with_elr*/);
+  }
+  return version;
+}
+
+// A recorded merge result may only be replayed by, and may only be collected
+// from, a plain SELECT that runs without a transaction.  Such a scan owns no
+// writes and cannot observe an uncommitted write of its own session, so the
+// rows can only describe committed data.  DML plans and scans inside a
+// transaction (an explicit one, autocommit=0, or one opened by a statement
+// trigger) are excluded, so an uncommitted write can never enter the cache and
+// a replay can never hide one.
+bool replay_eligible(transaction::ObTxDesc *tx_desc, ObExecContext *exec_ctx)
+{
+  bool eligible = false;
+  ObSQLSessionInfo *session = nullptr;
+  const ObPhysicalPlanCtx *plan_ctx = nullptr;
+  const ObPhysicalPlan *plan = nullptr;
+  if (OB_NOT_NULL(tx_desc) && OB_NOT_NULL(exec_ctx)
+      && OB_NOT_NULL(session = exec_ctx->get_my_session())
+      && OB_NOT_NULL(plan_ctx = exec_ctx->get_physical_plan_ctx())
+      && OB_NOT_NULL(plan = plan_ctx->get_phy_plan())) {
+    eligible = session->get_tx_desc() == tx_desc
+        && !session->is_in_transaction()
+        && plan->is_plain_select();
+  }
+  return eligible;
+}
+
+} // namespace
 
 ObDASLegacyTRMergeIter::ObDASLegacyTRMergeIter()
   : ObDASIter(ObDASIterType::DAS_ITER_TEXT_RETRIEVAL_MERGE),
@@ -55,7 +274,11 @@ ObDASLegacyTRMergeIter::ObDASLegacyTRMergeIter()
     flags_(0),
     check_rangekey_inited_(false),
     inv_idx_tablet_switched_(false),
-    is_inited_(false)
+    is_inited_(false),
+    replay_entry_(),
+    collecting_entry_(),
+    replay_pos_(0),
+    replay_active_(false)
 {
 }
 
@@ -708,19 +931,39 @@ int ObDASLegacyTRMergeIter::do_table_scan()
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
   } else {
-    if (function_lookup_mode_) {
-      // skip the following, which should have been done
-    } else if (OB_FAIL(init_das_iter_scan_params())) {
-    } else if (OB_FAIL(create_dim_iters())) {
-    } else if (OB_FAIL(create_sparse_retrieval_iter())) {
-    } else if (OB_FAIL(set_children_iter_rangekey())) {
+    bool replayed = false;
+    // Only a scan without physical state may be served from the replay cache.
+    // Once the scan has been set up, later reuses keep using that state so the
+    // two paths never mix.
+    if (OB_ISNULL(sparse_retrieval_iter_) && !function_lookup_mode_
+        && OB_FAIL(try_start_replay(replayed))) {
+      LOG_WARN("failed to probe the text retrieval replay cache", K(ret));
+      replayed = false;
+      ret = OB_SUCCESS;
     }
-    if (OB_FAIL(ret)) {
-    } else if (OB_UNLIKELY(!check_rangekey_inited_)) {
-      ret = OB_ERR_UNEXPECTED;
-    }
-    for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
-      if (OB_FAIL(children_[i]->do_table_scan())) {
+    if (OB_SUCC(ret) && !replayed) {
+      reset_replay_state();
+      if (function_lookup_mode_) {
+        // skip the following, which should have been done
+      } else if (OB_FAIL(init_das_iter_scan_params())) {
+      } else if (OB_FAIL(create_dim_iters())) {
+      } else if (OB_FAIL(create_sparse_retrieval_iter())) {
+      } else if (OB_FAIL(set_children_iter_rangekey())) {
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_UNLIKELY(!check_rangekey_inited_)) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
+        if (OB_FAIL(children_[i]->do_table_scan())) {
+        }
+      }
+      if (OB_SUCC(ret) && !function_lookup_mode_ && OB_FAIL(prepare_replay_collection())) {
+        // A result that cannot be collected only loses the cache; the scan
+        // itself has already been set up successfully.
+        LOG_WARN("failed to prepare text retrieval replay collection", K(ret));
+        collecting_entry_.reset();
+        ret = OB_SUCCESS;
       }
     }
   }
@@ -746,40 +989,52 @@ int ObDASLegacyTRMergeIter::inner_reuse()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (OB_ISNULL(sparse_retrieval_iter_)) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (query_tokens_.count() > 0) {
-    if (OB_NOT_NULL(total_doc_cnt_scan_param_)) {
-      if (OB_FAIL(reuse_das_iter_scan_param(total_doc_cnt_tablet_id_, *total_doc_cnt_scan_param_))) {
+  } else if (replay_active_ || OB_ISNULL(sparse_retrieval_iter_)) {
+    // A replayed scan holds no physical scan state, so there is nothing to
+    // reuse.  The next do_table_scan replays again or sets the scan up from
+    // scratch.
+    reset_replay_state();
+    check_rangekey_inited_ = false;
+    if (OB_NOT_NULL(mem_context_)) {
+      mem_context_->reset_remain_one_page();
+    }
+  } else {
+    // A collection that did not reach the end of the scan describes only a
+    // prefix of the result and must not be published.
+    collecting_entry_.reset();
+    if (query_tokens_.count() > 0) {
+      if (OB_NOT_NULL(total_doc_cnt_scan_param_)) {
+        if (OB_FAIL(reuse_das_iter_scan_param(total_doc_cnt_tablet_id_, *total_doc_cnt_scan_param_))) {
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < inv_scan_params_.count(); ++i) {
+        if (OB_FAIL(reuse_das_iter_scan_param(inv_idx_tablet_id_, *inv_scan_params_[i]))) {
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < inv_agg_params_.count(); ++i) {
+        if (OB_FAIL(reuse_das_iter_scan_param(inv_idx_tablet_id_, *inv_agg_params_[i]))) {
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < block_max_scan_params_.count(); ++i) {
+        if (OB_FAIL(reuse_das_iter_scan_param(inv_idx_tablet_id_, *block_max_scan_params_[i]))) {
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
+        if (OB_FAIL(children_[i]->reuse())) {
+        }
       }
     }
-    for (int64_t i = 0; OB_SUCC(ret) && i < inv_scan_params_.count(); ++i) {
-      if (OB_FAIL(reuse_das_iter_scan_param(inv_idx_tablet_id_, *inv_scan_params_[i]))) {
-      }
-    }
-    for (int64_t i = 0; OB_SUCC(ret) && i < inv_agg_params_.count(); ++i) {
-      if (OB_FAIL(reuse_das_iter_scan_param(inv_idx_tablet_id_, *inv_agg_params_[i]))) {
-      }
-    }
-    for (int64_t i = 0; OB_SUCC(ret) && i < block_max_scan_params_.count(); ++i) {
-      if (OB_FAIL(reuse_das_iter_scan_param(inv_idx_tablet_id_, *block_max_scan_params_[i]))) {
-      }
-    }
-    for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
-      if (OB_FAIL(children_[i]->reuse())) {
-      }
-    }
-  }
 
-  if (OB_SUCC(ret)) {
-    sparse_retrieval_iter_->reuse(inv_idx_tablet_switched_);
-    inv_idx_tablet_switched_ = false;
-  }
+    if (OB_SUCC(ret)) {
+      sparse_retrieval_iter_->reuse(inv_idx_tablet_switched_);
+      inv_idx_tablet_switched_ = false;
+    }
 
-  if (OB_NOT_NULL(mem_context_)) {
-    mem_context_->reset_remain_one_page();
+    if (OB_NOT_NULL(mem_context_)) {
+      mem_context_->reset_remain_one_page();
+    }
+    check_rangekey_inited_ = false;
   }
-  check_rangekey_inited_ = false;
   return ret;
 }
 
@@ -788,8 +1043,10 @@ int ObDASLegacyTRMergeIter::rescan()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (OB_ISNULL(sparse_retrieval_iter_)) {
-    ret = OB_ERR_UNEXPECTED;
+  } else if (replay_active_ || OB_ISNULL(sparse_retrieval_iter_)) {
+    // There is no physical scan state to rescan; run the scan from the start
+    // (do_table_scan revalidates the replay cache before using it).
+    ret = do_table_scan();
   } else if (!function_lookup_mode_ && OB_FAIL(set_children_iter_rangekey())) {
   } else if (OB_UNLIKELY(!check_rangekey_inited_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -859,6 +1116,7 @@ int ObDASLegacyTRMergeIter::inner_release()
   query_tokens_.reset();
   dim_weights_.reset();
   myself_allocator_.reset();
+  reset_replay_state();
   ir_ctdef_ = nullptr;
   ir_rtdef_ = nullptr;
   tx_desc_ = nullptr;
@@ -874,10 +1132,19 @@ int ObDASLegacyTRMergeIter::inner_get_next_row()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (replay_active_) {
+    ret = replay_get_next_row();
   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     ret = sparse_retrieval_iter_->get_next_row();
+    if (OB_SUCC(ret)) {
+      collect_replay_rows(1);
+    } else if (OB_ITER_END == ret) {
+      finish_replay_collection();
+    } else {
+      collecting_entry_.reset();
+    }
   }
   return ret;
 }
@@ -887,12 +1154,24 @@ int ObDASLegacyTRMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (OB_ISNULL(sparse_retrieval_iter_)) {
-    ret = OB_ERR_UNEXPECTED;
   } else if (OB_UNLIKELY(0 == capacity)) {
     count = 0;
+  } else if (replay_active_) {
+    ret = replay_get_next_rows(count, capacity);
+  } else if (OB_ISNULL(sparse_retrieval_iter_)) {
+    ret = OB_ERR_UNEXPECTED;
   } else {
     ret = sparse_retrieval_iter_->get_next_rows(capacity, count);
+    if (OB_SUCC(ret) || OB_ITER_END == ret) {
+      if (count > 0) {
+        collect_replay_rows(count);
+      }
+      if (OB_ITER_END == ret) {
+        finish_replay_collection();
+      }
+    } else {
+      collecting_entry_.reset();
+    }
   }
   return ret;
 }
@@ -1169,6 +1448,408 @@ int ObDASLegacyTRMergeIter::init_topk_limit()
   return ret;
 }
 
+int ObDASLegacyTRMergeIter::build_replay_key(std::string &key, bool &eligible) const
+{
+  int ret = OB_SUCCESS;
+  eligible = false;
+  key.clear();
+  const ObDASScanCtDef *inv_scan_ctdef = nullptr;
+  const ObDASScanRtDef *inv_scan_rtdef = nullptr;
+  ObEvalCtx *eval_ctx = OB_ISNULL(ir_rtdef_) ? nullptr : ir_rtdef_->eval_ctx_;
+  if (OB_ISNULL(ir_ctdef_) || OB_ISNULL(ir_rtdef_) || OB_ISNULL(eval_ctx)
+      || OB_ISNULL(snapshot_) || OB_ISNULL(ir_ctdef_->search_text_)
+      || OB_ISNULL(ir_ctdef_->inv_scan_domain_id_col_)
+      || OB_ISNULL(inv_scan_ctdef = ir_ctdef_->get_inv_idx_scan_ctdef())
+      || OB_ISNULL(inv_scan_rtdef = ir_rtdef_->get_inv_idx_scan_rtdef())) {
+    // Incomplete scan definition: no cache.
+  } else if (function_lookup_mode_ || NATURAL_LANGUAGE_MODE != ir_ctdef_->mode_flag_
+      || 0 == query_tokens_.count() || 0 == children_cnt_
+      || nullptr != ir_ctdef_->field_boost_expr_
+      || !total_doc_cnt_tablet_id_.is_valid() || !inv_idx_tablet_id_.is_valid()) {
+    // Field boosts are runtime expressions, and the other scan shapes have
+    // additional inputs that are not part of the key.
+  } else if (OB_ISNULL(ir_ctdef_->relevance_proj_col_) && !eval_ctx->is_vectorized()) {
+    // The non-vectorized merge projection always writes the relevance datum.
+  } else if (nullptr != ir_ctdef_->match_filter_
+      && (1 != ir_ctdef_->match_filter_->arg_cnt_
+          || ir_ctdef_->match_filter_->args_[0] != ir_ctdef_->relevance_proj_col_)) {
+    // Only the canonical BOOL(match score) filter is guaranteed to accept every
+    // replayed row without re-reading scan state.
+  } else if (!snapshot_->version().is_valid()) {
+    // No data version to validate against.
+  } else {
+    eligible = true;
+    const char magic[8] = {'O', 'B', 'F', 'T', 'R', 'P', '0', '1'};
+    key.append(magic, sizeof(magic));
+    const uint8_t mode = static_cast<uint8_t>(ir_ctdef_->mode_flag_);
+    const uint64_t ir_flags = ir_ctdef_->flags_;
+    const uint32_t plan_flags = flags_;
+    const uint8_t vectorized = eval_ctx->is_vectorized() ? 1 : 0;
+    const int64_t max_batch_size = eval_ctx->max_batch_size_;
+    uint8_t shape = 0;
+    if (ir_ctdef_->need_calc_relevance()) {
+      shape |= 1;
+    }
+    if (ir_ctdef_->need_proj_relevance_score()) {
+      shape |= 2;
+    }
+    if (ir_ctdef_->need_inv_idx_agg()) {
+      shape |= 4;
+    }
+    if (ir_ctdef_->need_block_max_scan()) {
+      shape |= 8;
+    }
+    if (ir_ctdef_->need_avg_doc_len_est()) {
+      shape |= 16;
+    }
+    if (ir_ctdef_->need_estimate_total_doc_cnt()) {
+      shape |= 32;
+    }
+    if (ir_ctdef_->avg_doc_len_est_spec_.can_est_by_sum_skip_index_) {
+      shape |= 64;
+    }
+    if (OB_NOT_NULL(ir_ctdef_->relevance_proj_col_)) {
+      shape |= 128;
+    }
+    append_replay_key_value(key, mode);
+    append_replay_key_value(key, ir_flags);
+    append_replay_key_value(key, plan_flags);
+    append_replay_key_value(key, shape);
+    append_replay_key_value(key, vectorized);
+    append_replay_key_value(key, max_batch_size);
+    const int32_t text_cs_type = static_cast<int32_t>(ir_ctdef_->search_text_->datum_meta_.cs_type_);
+    const int32_t text_type = static_cast<int32_t>(ir_ctdef_->search_text_->datum_meta_.type_);
+    append_replay_key_value(key, text_cs_type);
+    append_replay_key_value(key, text_type);
+    append_replay_key_value(key, ir_ctdef_->estimated_total_doc_cnt_);
+    append_replay_key_value(key, ir_rtdef_->minimum_should_match_);
+    const common::ObLimitParam &limit_param = inv_scan_rtdef->limit_param_;
+    append_replay_key_value(key, limit_param.limit_);
+    append_replay_key_value(key, limit_param.offset_);
+    append_replay_key_value(key, topk_limit_);
+    const uint64_t total_doc_cnt_tablet_id = total_doc_cnt_tablet_id_.id();
+    const uint64_t inv_idx_tablet_id = inv_idx_tablet_id_.id();
+    const uint64_t inv_ref_table_id = inv_scan_ctdef->ref_table_id_;
+    append_replay_key_value(key, total_doc_cnt_tablet_id);
+    append_replay_key_value(key, inv_idx_tablet_id);
+    append_replay_key_value(key, inv_ref_table_id);
+    const uint32_t child_count = children_cnt_;
+    append_replay_key_value(key, child_count);
+    const int32_t token_count = static_cast<int32_t>(query_tokens_.count());
+    append_replay_key_value(key, token_count);
+    for (int64_t i = 0; i < query_tokens_.count(); ++i) {
+      append_replay_key_string(key, query_tokens_.at(i));
+    }
+    const int32_t weight_count = static_cast<int32_t>(dim_weights_.count());
+    append_replay_key_value(key, weight_count);
+    for (int64_t i = 0; i < dim_weights_.count(); ++i) {
+      append_replay_key_value(key, dim_weights_.at(i));
+    }
+  }
+  return ret;
+}
+
+int ObDASLegacyTRMergeIter::try_start_replay(bool &started)
+{
+  int ret = OB_SUCCESS;
+  started = false;
+  // The replay cache allocates from the global heap, whose failure mode is a
+  // std::bad_alloc; a cache fault must never fail the scan, so it only makes
+  // this execution fall back to a normal table scan.
+  try {
+    std::string key;
+    bool eligible = false;
+    if (OB_FAIL(build_replay_key(key, eligible))) {
+    } else if (!eligible || !replay_eligible(tx_desc_, exec_ctx_)) {
+    } else {
+      const share::SCN scan_version = snapshot_->version();
+      const share::SCN current_version = get_data_version();
+      std::shared_ptr<ObFTSReplayEntry> entry;
+      if (current_version.is_valid() && scan_version.is_valid()) {
+        entry = ObFTSReplayCache::instance().get(key);
+      }
+      if (nullptr != entry && entry->complete_ && entry->commit_ts_.is_valid()
+          && entry->commit_ts_ == current_version && scan_version >= entry->version_) {
+        replay_entry_ = entry;
+        replay_pos_ = 0;
+        replay_active_ = true;
+        sr_iter_param_.limit_param_ = &ir_rtdef_->get_inv_idx_scan_rtdef()->limit_param_;
+        sr_iter_param_.eval_ctx_ = ir_rtdef_->eval_ctx_;
+        sr_iter_param_.id_proj_expr_ = ir_ctdef_->inv_scan_domain_id_col_;
+        sr_iter_param_.relevance_expr_ = ir_ctdef_->relevance_expr_;
+        sr_iter_param_.relevance_proj_expr_ = ir_ctdef_->relevance_proj_col_;
+        sr_iter_param_.dim_weights_ = dim_weights_.count() >= 1 ? &dim_weights_ : nullptr;
+        sr_iter_param_.filter_expr_ = nullptr;
+        sr_iter_param_.topk_limit_ = topk_limit_;
+        started = true;
+      }
+    }
+  } catch (...) {
+    LOG_WARN("text retrieval replay probe failed, falling back to a table scan");
+    started = false;
+    replay_entry_.reset();
+    replay_pos_ = 0;
+    replay_active_ = false;
+  }
+  return ret;
+}
+
+int ObDASLegacyTRMergeIter::prepare_replay_collection()
+{
+  int ret = OB_SUCCESS;
+  collecting_entry_.reset();
+  try {
+    std::string key;
+    bool eligible = false;
+    if (OB_FAIL(build_replay_key(key, eligible))) {
+    } else if (!eligible || !replay_eligible(tx_desc_, exec_ctx_)) {
+    } else {
+      const share::SCN snapshot_version = snapshot_->version();
+      const share::SCN commit_ts = get_data_version();
+      // The rows are read at snapshot_version, so every commit the service has
+      // already observed must be at or below that snapshot.  Otherwise a commit
+      // could have landed between the snapshot and this scan and the recorded
+      // rows would not describe the recorded version.
+      if (snapshot_version.is_valid() && commit_ts.is_valid() && commit_ts <= snapshot_version) {
+        std::shared_ptr<ObFTSReplayEntry> entry = std::make_shared<ObFTSReplayEntry>();
+        entry->key_ = std::move(key);
+        entry->version_ = snapshot_version;
+        entry->commit_ts_ = commit_ts;
+        entry->writes_relevance_ = nullptr != ir_ctdef_->relevance_proj_col_;
+        entry->id_is_int_ =
+            common::ObUInt64Type == ir_ctdef_->inv_scan_domain_id_col_->datum_meta_.type_;
+        entry->rows_.reserve(4096);
+        collecting_entry_ = entry;
+      }
+    }
+  } catch (...) {
+    LOG_WARN("text retrieval replay collection could not be prepared");
+    collecting_entry_.reset();
+  }
+  return ret;
+}
+
+void ObDASLegacyTRMergeIter::collect_replay_rows(const int64_t count)
+{
+  if (nullptr == collecting_entry_ || count <= 0 || OB_ISNULL(ir_ctdef_)
+      || OB_ISNULL(ir_rtdef_) || OB_ISNULL(ir_rtdef_->eval_ctx_)) {
+    return;
+  }
+  ObFTSReplayEntry &entry = *collecting_entry_;
+  ObEvalCtx *eval_ctx = ir_rtdef_->eval_ctx_;
+  ObExpr *id_expr = ir_ctdef_->inv_scan_domain_id_col_;
+  ObExpr *relevance_expr = ir_ctdef_->relevance_proj_col_;
+  if (static_cast<int64_t>(entry.rows_.size()) + count > REPLAY_MAX_ROWS
+      || static_cast<int64_t>(entry.id_bytes_.size()) > REPLAY_MAX_ID_BYTES) {
+    collecting_entry_.reset();
+    return;
+  }
+  const ObDatum *relevance_datums = entry.writes_relevance_
+      ? relevance_expr->locate_batch_datums(*eval_ctx) : nullptr;
+  try {
+    entry.rows_.reserve(entry.rows_.size() + count);
+    for (int64_t i = 0; i < count; ++i) {
+      // Read the datum the projection wrote for this row; a datum's batch index
+      // is masked exactly like the projection's write index.
+      const ObDatum &id_datum = id_expr->locate_expr_datum(*eval_ctx, i);
+      const ObDatum *relevance_datum = nullptr == relevance_datums
+          ? nullptr : &relevance_expr->locate_expr_datum(*eval_ctx, i);
+      if (OB_UNLIKELY(id_datum.is_null() || id_datum.is_ext() || id_datum.is_outrow()
+          || id_datum.has_lob_header())) {
+        collecting_entry_.reset();
+        return;
+      }
+      ObFTSReplayRow row;
+      row.relevance_ = nullptr == relevance_datum ? 0.0 : relevance_datum->get_double();
+      if (entry.id_is_int_) {
+        row.id_ = id_datum.get_int();
+        row.id_len_ = 0;
+      } else {
+        row.id_ = static_cast<int64_t>(entry.id_bytes_.size());
+        row.id_len_ = static_cast<int64_t>(id_datum.len_);
+        entry.id_bytes_.append(id_datum.ptr_, id_datum.len_);
+      }
+      entry.rows_.push_back(row);
+    }
+  } catch (...) {
+    LOG_WARN_RET(OB_SUCCESS, "text retrieval replay collection failed");
+    collecting_entry_.reset();
+  }
+  if (OB_NOT_NULL(collecting_entry_) && topk_mode_ && topk_limit_ > 0
+      && static_cast<int64_t>(collecting_entry_->rows_.size()) >= topk_limit_) {
+    // The pushed-down top-k heap never holds more than topk_limit_ rows, so the
+    // rows collected so far already are the whole scan output.  Publish now
+    // because the operator above a limit may stop pulling without ever asking
+    // for another batch, and then the end of the scan is never observed.
+    finish_replay_collection();
+  }
+}
+
+void ObDASLegacyTRMergeIter::finish_replay_collection()
+{
+  if (nullptr == collecting_entry_) {
+    return;
+  }
+  std::shared_ptr<ObFTSReplayEntry> entry = collecting_entry_;
+  collecting_entry_.reset();
+  if (OB_ISNULL(snapshot_) || OB_ISNULL(ir_rtdef_)) {
+    return;
+  }
+  // Record the maximum query score even when the plan never asked for it, so a
+  // replayed scan can answer a later normalization request exactly like the
+  // scan that produced the rows.
+  if (!entry->score_queried_ && OB_NOT_NULL(sparse_retrieval_iter_)) {
+    double live_score = 0.0;
+    const int score_ret = sparse_retrieval_iter_->get_query_max_score(live_score);
+    entry->score_queried_ = true;
+    entry->max_query_score_ = live_score;
+    entry->max_query_score_err_ = score_ret;
+  }
+  const share::SCN end_version = get_data_version();
+  const share::SCN scan_version = snapshot_->version();
+  if (!end_version.is_valid() || !scan_version.is_valid()) {
+    return;
+  }
+  // The row set is only a stable statement snapshot when no commit the service
+  // knows about landed while the scan ran and the read snapshot still sees the
+  // recorded version.  Otherwise a later replay could disagree with a fresh
+  // scan.
+  if (end_version != entry->commit_ts_ || scan_version < entry->version_) {
+    return;
+  }
+  if (entry->score_unstable_) {
+    return;
+  }
+  const ObDASScanRtDef *inv_scan_rtdef = ir_rtdef_->get_inv_idx_scan_rtdef();
+  if (OB_UNLIKELY(OB_ISNULL(inv_scan_rtdef))) {
+    return;
+  }
+  const common::ObLimitParam &limit_param = inv_scan_rtdef->limit_param_;
+  // The top-k iterator ignores the limit param and stops on the heap size, so a
+  // replayed top-k scan must report its end on the call after the last row
+  // exactly like the live one.
+  entry->ends_with_limit_ = !topk_mode_ && limit_param.is_valid()
+      && static_cast<int64_t>(entry->rows_.size()) >= limit_param.limit_;
+  entry->complete_ = true;
+  try {
+    ObFTSReplayCache::instance().put(entry);
+  } catch (...) {
+    LOG_WARN_RET(OB_SUCCESS, "failed to publish a text retrieval replay result");
+  }
+}
+
+int ObDASLegacyTRMergeIter::replay_get_next_row()
+{
+  int ret = OB_SUCCESS;
+  int64_t count = 0;
+  // Mirrors the sparse merge round: a single row is requested through the batch
+  // interface and an end reported together with that row is a protocol error.
+  if (OB_FAIL(replay_get_next_rows(count, 1))) {
+    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+    } else if (OB_UNLIKELY(count != 0)) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  } else if (OB_UNLIKELY(count != 1)) {
+    ret = OB_ERR_UNEXPECTED;
+  }
+  return ret;
+}
+
+int ObDASLegacyTRMergeIter::replay_get_next_rows(int64_t &count, int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  count = 0;
+  if (OB_ISNULL(replay_entry_) || OB_ISNULL(ir_rtdef_) || OB_ISNULL(ir_rtdef_->eval_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (0 == capacity) {
+  } else {
+    ObFTSReplayEntry &entry = *replay_entry_;
+    const int64_t total = static_cast<int64_t>(entry.rows_.size());
+    if (replay_pos_ >= total) {
+      ret = OB_ITER_END;
+    } else {
+      ObEvalCtx *eval_ctx = ir_rtdef_->eval_ctx_;
+      // The top-k iterator fills as much of the caller's capacity as the heap
+      // still holds; the merge iterator caps its batches at max_batch_size_.
+      const int64_t real_capacity = topk_mode_
+          ? capacity : MIN(capacity, sr_iter_param_.max_batch_size_);
+      const int64_t batch_count = MIN(real_capacity, total - replay_pos_);
+      ObExpr *id_expr = sr_iter_param_.id_proj_expr_;
+      ObExpr *relevance_expr = sr_iter_param_.relevance_proj_expr_;
+      const bool vectorized = eval_ctx->is_vectorized();
+      ObBitVector *id_flags = vectorized ? &id_expr->get_evaluated_flags(*eval_ctx) : nullptr;
+      ObBitVector *relevance_flags = (vectorized && entry.writes_relevance_)
+          ? &relevance_expr->get_evaluated_flags(*eval_ctx) : nullptr;
+      ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
+      for (int64_t i = 0; i < batch_count; ++i) {
+        guard.set_batch_idx(i);
+        const ObFTSReplayRow &row = entry.rows_[replay_pos_ + i];
+        ObDatum &id_datum = id_expr->locate_datum_for_write(*eval_ctx);
+        write_replay_id_datum(id_datum, entry, row);
+        if (nullptr != id_flags) {
+          id_flags->set(i);
+        }
+        if (entry.writes_relevance_) {
+          ObDatum &relevance_datum = relevance_expr->locate_datum_for_write(*eval_ctx);
+          relevance_datum.set_double(row.relevance_);
+          if (nullptr != relevance_flags) {
+            relevance_flags->set(i);
+          }
+        }
+      }
+      id_expr->set_evaluated_projected(*eval_ctx);
+      if (entry.writes_relevance_) {
+        relevance_expr->set_evaluated_projected(*eval_ctx);
+      }
+      count = batch_count;
+      replay_pos_ += batch_count;
+      // A scan stopped by its pushed-down limit reports the end together with
+      // the last row; an exhausted scan learns about the end on the next call.
+      if (replay_pos_ >= total && entry.ends_with_limit_) {
+        ret = OB_ITER_END;
+      }
+    }
+  }
+  return ret;
+}
+
+void ObDASLegacyTRMergeIter::reset_replay_state()
+{
+  replay_entry_.reset();
+  collecting_entry_.reset();
+  replay_pos_ = 0;
+  replay_active_ = false;
+}
+
+int ObDASLegacyTRMergeIter::get_query_max_score(double &score)
+{
+  int ret = OB_SUCCESS;
+  score = 0.0;
+  if (OB_NOT_NULL(sparse_retrieval_iter_)) {
+    ret = sparse_retrieval_iter_->get_query_max_score(score);
+    if (OB_NOT_NULL(collecting_entry_)) {
+      if (!collecting_entry_->score_queried_) {
+        collecting_entry_->score_queried_ = true;
+        collecting_entry_->max_query_score_ = score;
+        collecting_entry_->max_query_score_err_ = ret;
+      } else if (collecting_entry_->max_query_score_err_ != ret
+          || (OB_SUCCESS == ret && collecting_entry_->max_query_score_ != score)) {
+        collecting_entry_->score_unstable_ = true;
+      }
+    }
+  } else if (OB_NOT_NULL(replay_entry_)) {
+    if (!replay_entry_->score_queried_) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("replayed text retrieval scan has no recorded query max score", K(ret));
+    } else if (OB_SUCCESS != replay_entry_->max_query_score_err_) {
+      ret = replay_entry_->max_query_score_err_;
+    } else {
+      score = replay_entry_->max_query_score_;
+    }
+  }
+  return ret;
+}
+
 namespace
 {
 
@@ -1285,6 +1966,7 @@ public:
         if (OB_SUCCESS != ret) {
         }
       }
+      iter_->~ObDASLegacyTRMergeIter();
       allocator->free(iter_);
       iter_ = nullptr;
     }

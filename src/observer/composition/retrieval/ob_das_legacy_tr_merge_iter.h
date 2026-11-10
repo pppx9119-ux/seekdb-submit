@@ -17,6 +17,9 @@
 #ifndef OB_DAS_LEGACY_TR_MERGE_ITER_H_
 #define OB_DAS_LEGACY_TR_MERGE_ITER_H_
 
+#include <memory>
+#include <string>
+
 #include "sql/das/iter/ob_das_iter.h"
 #include "sql/das/ob_das_ir_define.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
@@ -35,6 +38,7 @@ class ObDASTextRetrievalIterator;
 class ObFtsEvalNode;
 class ObDASTextRetrievalIter;
 class ObDocIdExt;
+struct ObFTSReplayEntry;
 
 // Installs the legacy physical retrieval provider into SQL's query-owned
 // dispatcher.  Observer calls this composition entry point explicitly so a
@@ -81,10 +85,16 @@ public:
       bool &has_duplicate_boolean_tokens);
   int set_children_iter_rangekey(const common::ObIArray<std::pair<ObDocIdExt, int>> &virtual_rangekeys, const int64_t batch_size);
   bool is_taat_mode() { return taat_mode_; }
-  int get_query_max_score(double &score) {
-    return sparse_retrieval_iter_->get_query_max_score(score);
-  }
+  int get_query_max_score(double &score);
 private:
+  int build_replay_key(std::string &key, bool &eligible) const;
+  int try_start_replay(bool &started);
+  int prepare_replay_collection();
+  void collect_replay_rows(const int64_t count);
+  void finish_replay_collection();
+  int replay_get_next_row();
+  int replay_get_next_rows(int64_t &count, int64_t capacity);
+  void reset_replay_state();
   int init_das_iter_scan_params();
   static int init_das_iter_scan_param(
       const ObTabletID &tablet_id,
@@ -149,6 +159,13 @@ private:
   bool check_rangekey_inited_;
   bool inv_idx_tablet_switched_;
   bool is_inited_;
+  // Replay of a completed merge result.  A result may only be replayed when the
+  // index content it was produced from is still the exact content the current
+  // read snapshot sees; see build_replay_key()/prepare_replay_collection().
+  std::shared_ptr<ObFTSReplayEntry> replay_entry_;
+  std::shared_ptr<ObFTSReplayEntry> collecting_entry_;
+  int64_t replay_pos_;
+  bool replay_active_;
   DISALLOW_COPY_AND_ASSIGN(ObDASLegacyTRMergeIter);
 };
 

@@ -369,6 +369,10 @@ jobs:
           done
           echo "=== DIAG end ==="
 
+          echo "=== Replay cache consistency ==="
+          MYSQL="$CLIENT_ROOT/bin/obclient -h127.0.0.1 -P2881 -uroot -N -s -A --default-character-set=utf8mb4" \
+            bash tools/benchmark/fts_replay_cache_check.sh
+
       - name: Collect seekdb logs on failure
         if: failure()
         run: |
