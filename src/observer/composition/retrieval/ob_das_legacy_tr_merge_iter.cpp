@@ -226,14 +226,16 @@ share::SCN get_data_version()
 // rows can only describe committed data.  DML plans and scans inside a
 // transaction (an explicit one, autocommit=0, or one opened by a statement
 // trigger) are excluded, so an uncommitted write can never enter the cache and
-// a replay can never hide one.
+// a replay can never hide one.  A plain autocommit SELECT runs without any
+// transaction descriptor at all, so an empty descriptor is the expected state
+// and not a reason to reject the scan.
 bool replay_eligible(transaction::ObTxDesc *tx_desc, ObExecContext *exec_ctx)
 {
   bool eligible = false;
   ObSQLSessionInfo *session = nullptr;
   const ObPhysicalPlanCtx *plan_ctx = nullptr;
   const ObPhysicalPlan *plan = nullptr;
-  if (OB_NOT_NULL(tx_desc) && OB_NOT_NULL(exec_ctx)
+  if (OB_NOT_NULL(exec_ctx)
       && OB_NOT_NULL(session = exec_ctx->get_my_session())
       && OB_NOT_NULL(plan_ctx = exec_ctx->get_physical_plan_ctx())
       && OB_NOT_NULL(plan = plan_ctx->get_phy_plan())) {
