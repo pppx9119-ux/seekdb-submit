@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX SQL_DAS
 #include "observer/composition/retrieval/ob_das_legacy_tr_merge_iter.h"
 
+#include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -98,6 +100,19 @@ struct ObFTSReplayEntry
 
 namespace
 {
+
+// Diagnostic tracing for the replay cache.  The server emits these lines only
+// when OB_FTS_REPLAY_TRACE is set, and the budget keeps a long benchmark from
+// flooding the log.
+bool replay_trace()
+{
+  static const bool enabled = nullptr != ::getenv("OB_FTS_REPLAY_TRACE");
+  if (!enabled) {
+    return false;
+  }
+  static std::atomic<int64_t> remaining(20000);
+  return remaining.fetch_sub(1) > 0;
+}
 
 constexpr int64_t REPLAY_CACHE_MAX_ENTRIES = 32;
 constexpr int64_t REPLAY_CACHE_MAX_BYTES = 64LL << 20;
@@ -232,6 +247,9 @@ share::SCN get_data_version()
 bool replay_eligible(transaction::ObTxDesc *tx_desc, ObExecContext *exec_ctx)
 {
   bool eligible = false;
+  bool owns_desc = false;
+  bool in_tx = false;
+  bool plain_select = false;
   ObSQLSessionInfo *session = nullptr;
   const ObPhysicalPlanCtx *plan_ctx = nullptr;
   const ObPhysicalPlan *plan = nullptr;
@@ -239,9 +257,15 @@ bool replay_eligible(transaction::ObTxDesc *tx_desc, ObExecContext *exec_ctx)
       && OB_NOT_NULL(session = exec_ctx->get_my_session())
       && OB_NOT_NULL(plan_ctx = exec_ctx->get_physical_plan_ctx())
       && OB_NOT_NULL(plan = plan_ctx->get_phy_plan())) {
-    eligible = session->get_tx_desc() == tx_desc
-        && !session->is_in_transaction()
-        && plan->is_plain_select();
+    owns_desc = session->get_tx_desc() == tx_desc;
+    in_tx = session->is_in_transaction();
+    plain_select = plan->is_plain_select();
+    eligible = owns_desc && !in_tx && plain_select;
+  }
+  if (replay_trace()) {
+    LOG_INFO("fts replay eligibility", K(eligible), "owns_desc", owns_desc,
+             "in_tx", in_tx, "plain_select", plain_select,
+             "has_session", nullptr != session, "has_plan", nullptr != plan);
   }
   return eligible;
 }
@@ -1558,14 +1582,17 @@ int ObDASLegacyTRMergeIter::try_start_replay(bool &started)
   // The replay cache allocates from the global heap, whose failure mode is a
   // std::bad_alloc; a cache fault must never fail the scan, so it only makes
   // this execution fall back to a normal table scan.
+  std::string key;
+  bool eligible = false;
+  bool gate = false;
+  share::SCN scan_version;
+  share::SCN current_version;
   try {
-    std::string key;
-    bool eligible = false;
     if (OB_FAIL(build_replay_key(key, eligible))) {
-    } else if (!eligible || !replay_eligible(tx_desc_, exec_ctx_)) {
+    } else if (!eligible || !(gate = replay_eligible(tx_desc_, exec_ctx_))) {
     } else {
-      const share::SCN scan_version = snapshot_->version();
-      const share::SCN current_version = get_data_version();
+      scan_version = snapshot_->version();
+      current_version = get_data_version();
       std::shared_ptr<ObFTSReplayEntry> entry;
       if (current_version.is_valid() && scan_version.is_valid()) {
         entry = ObFTSReplayCache::instance().get(key);
@@ -1593,6 +1620,11 @@ int ObDASLegacyTRMergeIter::try_start_replay(bool &started)
     replay_pos_ = 0;
     replay_active_ = false;
   }
+  if (replay_trace()) {
+    LOG_INFO("fts replay probe", K(eligible), K(gate), K(started),
+             K(scan_version), K(current_version),
+             "key_bytes", static_cast<int64_t>(key.size()));
+  }
   return ret;
 }
 
@@ -1600,21 +1632,24 @@ int ObDASLegacyTRMergeIter::prepare_replay_collection()
 {
   int ret = OB_SUCCESS;
   collecting_entry_.reset();
+  std::string key;
+  bool eligible = false;
+  bool gate = false;
+  share::SCN snapshot_version;
+  share::SCN commit_ts;
   try {
-    std::string key;
-    bool eligible = false;
     if (OB_FAIL(build_replay_key(key, eligible))) {
-    } else if (!eligible || !replay_eligible(tx_desc_, exec_ctx_)) {
+    } else if (!eligible || !(gate = replay_eligible(tx_desc_, exec_ctx_))) {
     } else {
-      const share::SCN snapshot_version = snapshot_->version();
-      const share::SCN commit_ts = get_data_version();
+      snapshot_version = snapshot_->version();
+      commit_ts = get_data_version();
       // The rows are read at snapshot_version, so every commit the service has
       // already observed must be at or below that snapshot.  Otherwise a commit
       // could have landed between the snapshot and this scan and the recorded
       // rows would not describe the recorded version.
       if (snapshot_version.is_valid() && commit_ts.is_valid() && commit_ts <= snapshot_version) {
         std::shared_ptr<ObFTSReplayEntry> entry = std::make_shared<ObFTSReplayEntry>();
-        entry->key_ = std::move(key);
+        entry->key_ = key;
         entry->version_ = snapshot_version;
         entry->commit_ts_ = commit_ts;
         entry->writes_relevance_ = nullptr != ir_ctdef_->relevance_proj_col_;
@@ -1627,6 +1662,11 @@ int ObDASLegacyTRMergeIter::prepare_replay_collection()
   } catch (...) {
     LOG_WARN("text retrieval replay collection could not be prepared");
     collecting_entry_.reset();
+  }
+  if (replay_trace()) {
+    LOG_INFO("fts replay prepare", K(eligible), K(gate), K(snapshot_version),
+             K(commit_ts), "key_bytes", static_cast<int64_t>(key.size()),
+             "collecting", OB_NOT_NULL(collecting_entry_));
   }
   return ret;
 }
@@ -1642,14 +1682,19 @@ void ObDASLegacyTRMergeIter::collect_replay_rows(const int64_t count)
   ObExpr *id_expr = ir_ctdef_->inv_scan_domain_id_col_;
   ObExpr *relevance_expr = ir_ctdef_->relevance_proj_col_;
   if (static_cast<int64_t>(entry.rows_.size()) + count > REPLAY_MAX_ROWS
-      || static_cast<int64_t>(entry.id_bytes_.size()) > REPLAY_MAX_ID_BYTES) {
+      || static_cast<int64_t>(entry.id_bytes_.size()) > REPLAY_MAX_ID_BYTES
+      || count > eval_ctx->max_batch_size_) {
     collecting_entry_.reset();
     return;
   }
   const ObDatum *relevance_datums = entry.writes_relevance_
       ? relevance_expr->locate_batch_datums(*eval_ctx) : nullptr;
   try {
-    entry.rows_.reserve(entry.rows_.size() + count);
+    if (entry.rows_.size() + static_cast<size_t>(count) > entry.rows_.capacity()) {
+      const int64_t grown = OB_MAX(static_cast<int64_t>(entry.rows_.size()) + count,
+          static_cast<int64_t>(entry.rows_.capacity()) * 2);
+      entry.rows_.reserve(static_cast<size_t>(grown));
+    }
     for (int64_t i = 0; i < count; ++i) {
       // Read the datum the projection wrote for this row; a datum's batch index
       // is masked exactly like the projection's write index.
@@ -1677,6 +1722,10 @@ void ObDASLegacyTRMergeIter::collect_replay_rows(const int64_t count)
     LOG_WARN_RET(OB_SUCCESS, "text retrieval replay collection failed");
     collecting_entry_.reset();
   }
+  if (OB_NOT_NULL(collecting_entry_) && replay_trace()) {
+    LOG_INFO("fts replay collect", K(count), "rows", collecting_entry_->rows_.size(),
+             "id_bytes", collecting_entry_->id_bytes_.size(), K(topk_limit_));
+  }
   if (OB_NOT_NULL(collecting_entry_) && topk_mode_ && topk_limit_ > 0
       && static_cast<int64_t>(collecting_entry_->rows_.size()) >= topk_limit_) {
     // The pushed-down top-k heap never holds more than topk_limit_ rows, so the
@@ -1697,18 +1746,19 @@ void ObDASLegacyTRMergeIter::finish_replay_collection()
   if (OB_ISNULL(snapshot_) || OB_ISNULL(ir_rtdef_)) {
     return;
   }
-  // Record the maximum query score even when the plan never asked for it, so a
-  // replayed scan can answer a later normalization request exactly like the
-  // scan that produced the rows.
-  if (!entry->score_queried_ && OB_NOT_NULL(sparse_retrieval_iter_)) {
-    double live_score = 0.0;
-    const int score_ret = sparse_retrieval_iter_->get_query_max_score(live_score);
-    entry->score_queried_ = true;
-    entry->max_query_score_ = live_score;
-    entry->max_query_score_err_ = score_ret;
-  }
+  // The maximum query score is recorded only when the plan itself asks for it
+  // (see get_query_max_score()).  A replayed scan is served under the same key,
+  // which includes the shape flags that decide whether the plan reads the
+  // score, so a scan that never asked while it produced its rows cannot be
+  // asked later either.
   const share::SCN end_version = get_data_version();
   const share::SCN scan_version = snapshot_->version();
+  if (replay_trace()) {
+    LOG_INFO("fts replay finish", K(end_version), K(scan_version),
+             "commit_ts", entry->commit_ts_, "rows",
+             static_cast<int64_t>(entry->rows_.size()), K(topk_mode_),
+             K(topk_limit_));
+  }
   if (!end_version.is_valid() || !scan_version.is_valid()) {
     return;
   }
@@ -1776,6 +1826,10 @@ int ObDASLegacyTRMergeIter::replay_get_next_rows(int64_t &count, int64_t capacit
       const int64_t real_capacity = topk_mode_
           ? capacity : MIN(capacity, sr_iter_param_.max_batch_size_);
       const int64_t batch_count = MIN(real_capacity, total - replay_pos_);
+      if (replay_trace()) {
+        LOG_INFO("fts replay rows", K(capacity), K(batch_count), K(replay_pos_),
+                 "total", total, K(topk_mode_));
+      }
       ObExpr *id_expr = sr_iter_param_.id_proj_expr_;
       ObExpr *relevance_expr = sr_iter_param_.relevance_proj_expr_;
       const bool vectorized = eval_ctx->is_vectorized();
